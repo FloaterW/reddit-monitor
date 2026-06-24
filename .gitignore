@@ -1,0 +1,22 @@
+# Secrets — never commit real credentials
+.env
+.gmail_app_password
+
+# Scraper output
+*_results.json
+*_comments.json
+reddit_*.json
+deep_*.json
+digest_*.md
+digest_*.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
