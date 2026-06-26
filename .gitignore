@@ -16,7 +16,15 @@ digest_*.json
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
+dist/
 
-# IDE
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# IDE / local tooling
 .vscode/
 .idea/
+.claude/

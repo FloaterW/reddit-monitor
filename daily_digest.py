@@ -9,8 +9,13 @@ Usage:
   python daily_digest.py --save digest.md    # save summary to file
 """
 
-import os, sys, json, time, re, subprocess
-from datetime import datetime, timezone, timedelta
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):
@@ -56,7 +61,8 @@ MAX_RESULTS_PER_KEYWORD = 30
 POST_SORT = "new"
 TIME_FILTER = "day"
 
-LLM_MODEL = "claude-sonnet-4-6"
+LLM_COMMAND = os.getenv("DIGEST_LLM_COMMAND", "claude")
+LLM_MODEL = os.getenv("DIGEST_LLM_MODEL", "claude-sonnet-4-6")
 
 # Email — leave GMAIL_APP_PASSWORD empty to skip emailing.
 # Generate an app password at https://myaccount.google.com/apppasswords
@@ -73,7 +79,7 @@ if _pw_file.exists():
 # Scraping — fetch once, filter locally for all keywords
 # ---------------------------------------------------------------------------
 from reddit_scraper import (
-    _fetch, _parse_things, _parse_comments, _dedup_key, _matches_query,
+    _dedup_key, _fetch, _matches_query, _parse_comments, _parse_things,
 )
 
 
@@ -152,10 +158,14 @@ def scrape_all(keywords, subreddits, posts_per_sub, time_filter):
     raw = _fetch_all_comments(subreddits, posts_per_sub, POST_SORT, time_filter)
     print(f"\n  Total comments fetched: {len(raw)}")
 
-    hours = TIME_WINDOW_HOURS.get(time_filter, 24)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    recent = [c for c in raw if _comment_in_window(c.get("created", ""), cutoff)]
-    print(f"  Comments within last {hours}h: {len(recent)} (filtered {len(raw) - len(recent)} older)")
+    if time_filter == "all":
+        recent = raw
+        print("  Time filter: all (no timestamp cutoff)")
+    else:
+        hours = TIME_WINDOW_HOURS.get(time_filter, 24)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        recent = [c for c in raw if _comment_in_window(c.get("created", ""), cutoff)]
+        print(f"  Comments within last {hours}h: {len(recent)} (filtered {len(raw) - len(recent)} older)")
 
     matched = []
     seen = set()
@@ -265,21 +275,39 @@ def summarize(comments, time_window="24 hours"):
     )
 
     print(f"\nSending {len(comments)} comments for summarization...\n")
+    print(f"  LLM command: {LLM_COMMAND}, model: {LLM_MODEL}")
+
+    cmd = [LLM_COMMAND, "-p", "--model", LLM_MODEL]
 
     try:
         result = subprocess.run(
-            ["claude", "-p", "--model", LLM_MODEL],
+            cmd,
             input=prompt_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
             timeout=600,
         )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"LLM command '{LLM_COMMAND}' not found. "
+            f"Install it or set DIGEST_LLM_COMMAND in your .env file "
+            f"to the path of your LLM CLI tool."
+        )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Summarization timed out after 10 minutes")
+        raise RuntimeError(
+            "Summarization timed out after 10 minutes. "
+            "Try reducing --posts or narrowing the --time window."
+        )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Summarization failed: {result.stderr.strip()}")
+        stderr = result.stderr.strip()
+        raise RuntimeError(
+            f"LLM command exited with code {result.returncode}.\n"
+            f"  Command: {' '.join(cmd)}\n"
+            f"  Error: {stderr or '(no stderr output)'}\n"
+            f"  Check that '{LLM_COMMAND}' is installed and '{LLM_MODEL}' is a valid model."
+        )
 
     return result.stdout.strip()
 

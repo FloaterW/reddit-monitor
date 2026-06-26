@@ -28,15 +28,15 @@ USAGE EXAMPLES:
     python reddit_scraper.py search "Tesla" --output my_results.json
 """
 
-import os
-import sys
-import json
-import time
-import re
 import argparse
+import json
+import os
+import re
+import sys
+import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 from html import unescape
+from urllib.parse import urlparse
 
 import requests
 
@@ -86,7 +86,7 @@ def _fetch(path, params=None):
 
         try:
             resp.raise_for_status()
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             print(f"  WARNING: HTTP {resp.status_code} — skipping this request.")
             return None
         return resp.text
@@ -405,7 +405,18 @@ def _matches_query(query_lower, text, use_word_boundary=True):
 
 
 def _dedup_key(comment):
-    return (comment.get("author", ""), comment.get("body", "")[:80])
+    cid = comment.get("id", "")
+    if cid:
+        return cid
+    import hashlib
+    parts = (
+        comment.get("author", ""),
+        comment.get("body", ""),
+        comment.get("created", ""),
+        comment.get("post_permalink", ""),
+    )
+    blob = "\0".join(parts).encode("utf-8", errors="replace")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def _scan_subreddit_comments(subreddit_name, query_lower, sort, time_filter,

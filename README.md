@@ -64,10 +64,15 @@ A sample digest output is included in [`example_digest.md`](example_digest.md).
 ## Quick Start
 
 ```bash
-# Install dependencies
+# Clone and install
+git clone https://github.com/FloaterW/reddit-monitor.git
+cd reddit-monitor
 pip install -r requirements.txt
 
-# Run with default config (edit SUBREDDITS and KEYWORDS in daily_digest.py)
+# Copy and edit .env (optional — see .env.example)
+cp .env.example .env
+
+# Run with default config (credit card / churning keywords)
 python daily_digest.py
 
 # Run with custom subreddits and keywords
@@ -105,7 +110,16 @@ python daily_digest.py [OPTIONS]
 
 ## Summarization Engine
 
-The digest pipeline uses an LLM to summarize scraped comments into a themed, actionable digest. The summarization step is handled via a CLI subprocess call in the `summarize()` function of `daily_digest.py`. The model and CLI command are configurable at the top of the file — swap in any LLM CLI that accepts piped text input and returns text output.
+The digest pipeline uses an LLM to summarize scraped comments into a themed, actionable digest. The summarization step shells out to a CLI tool (default: `claude`) as a subprocess. The CLI must accept the same argument pattern: `<command> -p --model <model>`, reading the prompt from stdin and writing the summary to stdout.
+
+**Configuration** via environment variables or `.env`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DIGEST_LLM_COMMAND` | `claude` | CLI executable for summarization |
+| `DIGEST_LLM_MODEL` | `claude-sonnet-4-6` | Model name passed via `--model` |
+
+Any CLI that accepts `-p --model <name>` with stdin/stdout will work as a drop-in replacement. If the configured CLI is not installed, the pipeline prints an actionable error message instead of a raw traceback.
 
 The prompt instructs the summarizer to:
 - Organize by theme, not by subreddit or keyword
@@ -196,7 +210,7 @@ The scraper parses old.reddit.com HTML directly — no Reddit API key, OAuth, or
 - **Post parsing** — Extracts `data-*` attributes from `<div>` elements with `data-type="link"` (score, author, timestamp, permalink)
 - **Comment parsing** — Two-pass approach: first pass uses `html.parser.HTMLParser` to walk the DOM and track comment depth via `<div>` nesting; second pass uses regex to extract body text, score, and timestamps from the raw HTML
 - **Rate limiting** — 1s between comment fetches, 1.5s between posts, 2s between subreddits, plus automatic retry with backoff on HTTP 429
-- **Deduplication** — Uses `(author, body[:80])` tuples as dedup keys across sort orders
+- **Deduplication** — Uses comment ID as the primary dedup key, falling back to a composite hash of author, body, timestamp, and post permalink when IDs are unavailable
 - **Graceful degradation** — Network errors, 403s, 404s, and 5xx responses return `None` instead of crashing, so a single failed request doesn't kill the entire run
 
 ## Output Files
@@ -207,23 +221,47 @@ Each run produces:
 - **`digest_YYYYMMDD_HHMM.json`** — Raw scraped comments with metadata (when `--save-raw` is used)
 - **`digest_run.log`** — Append-only log of all scheduled runs (stdout + stderr)
 
+## Testing
+
+```bash
+# Install dev dependencies
+pip install -r requirements-dev.txt
+
+# Run tests
+python -m pytest -q
+
+# Lint
+python -m ruff check .
+```
+
+Tests cover HTML parsing, keyword matching, dedup logic, time-window filtering, and markdown email preprocessing — all with static fixtures, no network calls.
+
 ## Project Structure
 
 ```
 reddit-digest/
-├── reddit_scraper.py       # Standalone Reddit scraper (no API key needed)
-├── daily_digest.py         # Digest orchestrator (scrape → summarize → email)
-├── run_digest.bat          # Windows Task Scheduler wrapper
-├── requirements.txt        # Python dependencies
-├── example_digest.md       # Sample digest output
-├── .env.example            # Environment variable template
-├── .gitignore              # Excludes credentials, outputs, caches
-└── README.md               # This file
+├── reddit_scraper.py           # Standalone Reddit scraper (no API key needed)
+├── daily_digest.py             # Digest orchestrator (scrape → summarize → email)
+├── run_digest.bat              # Windows Task Scheduler wrapper
+├── requirements.txt            # Python dependencies
+├── requirements-dev.txt        # Dev dependencies (pytest, ruff)
+├── pyproject.toml              # Project config (pytest, ruff settings)
+├── example_digest.md           # Sample digest output
+├── .env.example                # Environment variable template
+├── .github/workflows/ci.yml    # GitHub Actions CI (lint + test)
+├── .gitignore                  # Excludes credentials, outputs, caches
+├── tests/                      # pytest test suite
+└── README.md                   # This file
 ```
 
-## Known Limitations
+## Design Tradeoffs / Limitations
 
-- Relies on HTML scraping of old.reddit.com — may break if Reddit changes their markup
-- Short keywords (e.g., "ink", "boa") can produce false-positive matches; the summarizer filters most noise
-- Windows Task Scheduler requires the machine to be on (though `StartWhenAvailable` catches up on wake)
-- Email delivery is Gmail-only via SMTP; other providers would need minor code changes
+**Why HTML scraping instead of the Reddit API or PRAW?** This project deliberately avoids OAuth credentials and API key management — it parses `old.reddit.com` HTML directly with regex and `html.parser`. This means zero signup friction and no rate-limit quotas, but the tradeoff is **markup fragility**: if Reddit changes their HTML structure, the parsers will need updating. A future iteration could migrate to PRAW or the official Reddit API for more stable data access.
+
+**Rate limiting.** The scraper adds 1–2 second delays between requests and handles HTTP 429 responses with backoff. Aggressive usage (many subreddits, high `--posts` counts) may still trigger Reddit's rate limiter, which will slow the run but not crash it.
+
+**Keyword false positives.** Short keywords like "ink" or "boa" use word-boundary matching (`\b`) to avoid substring hits (e.g., "thinking"), but edge cases remain. The LLM summarizer typically filters noise, but the raw JSON output may contain false matches.
+
+**Email delivery.** Gmail-only via SMTP with app passwords. Other providers would need changes to the SMTP host/port configuration.
+
+**Scheduling.** The included `run_digest.bat` is Windows-specific. On macOS/Linux, use `cron` instead. The machine must be on at the scheduled time (though `StartWhenAvailable` catches up on wake).
