@@ -266,14 +266,17 @@ def summarize(comments, time_window="24 hours"):
 
     print(f"\nSending {len(comments)} comments for summarization...\n")
 
-    result = subprocess.run(
-        ["claude", "-p", "--model", LLM_MODEL],
-        input=prompt_text,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=300,
-    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", LLM_MODEL],
+            input=prompt_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Summarization timed out after 10 minutes")
 
     if result.returncode != 0:
         raise RuntimeError(f"Summarization failed: {result.stderr.strip()}")
@@ -462,6 +465,7 @@ def main():
         summary = summarize(comments, time_label.get(args.time_filter, "24 hours"))
     except RuntimeError as e:
         print(f"\nERROR: {e}")
+        print("Raw data was saved — rerun with a longer timeout or fewer posts.")
         sys.exit(1)
 
     print("\n" + summary)
