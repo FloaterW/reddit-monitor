@@ -288,17 +288,22 @@ def summarize(comments, time_window="24 hours"):
 # Email
 # ---------------------------------------------------------------------------
 def _preprocess_md(md_text):
-    """Ensure blank lines before lists so the markdown lib parses them as <ul>/<ol>."""
+    """Preprocess markdown for the markdown lib: ensure blank lines before lists,
+    and double indentation on nested list items (the lib requires 4-space nesting)."""
     lines = md_text.split("\n")
     out = []
     for i, line in enumerate(lines):
         stripped = line.lstrip()
         is_list = stripped.startswith("- ") or re.match(r"^\d+\.\s", stripped)
-        if is_list and i > 0 and out and out[-1].strip() != "":
-            prev = out[-1].lstrip()
-            prev_is_list = prev.startswith("- ") or re.match(r"^\d+\.\s", prev)
-            if not prev_is_list and prev != "---":
-                out.append("")
+        if is_list:
+            indent = len(line) - len(stripped)
+            if indent > 0:
+                line = " " * (indent * 2) + stripped
+            if i > 0 and out and out[-1].strip() != "":
+                prev = out[-1].lstrip()
+                prev_is_list = prev.startswith("- ") or re.match(r"^\d+\.\s", prev)
+                if not prev_is_list and prev != "---":
+                    out.append("")
         out.append(line)
     return "\n".join(out)
 
@@ -334,7 +339,7 @@ def _wrap_html_email(inner_html, title):
         <!-- Footer -->
         <tr><td style="padding:20px 32px;border-top:1px solid #e2e8f0;
                        font-size:12px;color:#a0aec0;text-align:center">
-          Reddit Churning Digest &middot; Delivered daily at 6:30 PM
+          Reddit Digest &middot; Delivered daily at 6:30 PM
         </td></tr>
       </table>
     </td></tr>
@@ -365,6 +370,12 @@ def _inline_styles(html):
             f'<{tag} style="{style}"\\1',
             html,
         )
+    html = re.sub(
+        r"(<li[^>]*>(?:(?!</li>).)*?)<(ul|ol)\s+style=\"([^\"]*)\"",
+        lambda m: m.group(1) + f'<{m.group(2)} style="{m.group(3)};padding-left:24px;margin:4px 0 4px 0"',
+        html,
+        flags=re.DOTALL,
+    )
     return html
 
 
