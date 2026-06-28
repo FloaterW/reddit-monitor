@@ -160,3 +160,25 @@ class TestSummarizeErrors:
                 assert False, "Should have raised"
             except RuntimeError as e:
                 assert "timed out" in str(e)
+
+    def test_strips_llm_preamble(self):
+        preamble = "No skills apply here — this is a content synthesis task.\n\n"
+        digest = "# Daily Digest\n\n## Section One\n\nContent here."
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=preamble + digest, stderr="")
+        with patch("subprocess.run", return_value=fake):
+            result = summarize([{"body": "test", "subreddit": "t", "post_title": "t",
+                                 "author": "a", "score": 0, "created": "", "id": "",
+                                 "matched_keywords": [], "depth": 0, "parent_id": "",
+                                 "post_permalink": ""}])
+            assert result.startswith("# Daily Digest")
+            assert "skills" not in result
+
+    def test_preserves_clean_output(self):
+        digest = "# Daily Digest\n\n## Section One\n\nContent here."
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=digest, stderr="")
+        with patch("subprocess.run", return_value=fake):
+            result = summarize([{"body": "test", "subreddit": "t", "post_title": "t",
+                                 "author": "a", "score": 0, "created": "", "id": "",
+                                 "matched_keywords": [], "depth": 0, "parent_id": "",
+                                 "post_permalink": ""}])
+            assert result == digest

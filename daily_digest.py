@@ -309,7 +309,15 @@ def summarize(comments, time_window="24 hours"):
             f"  Check that '{LLM_COMMAND}' is installed and '{LLM_MODEL}' is a valid model."
         )
 
-    return result.stdout.strip()
+    output = result.stdout.strip()
+    heading_pos = output.find("\n# ")
+    if heading_pos == -1:
+        heading_pos = output.find("# ")
+        if heading_pos == 0:
+            return output
+    if heading_pos > 0:
+        output = output[heading_pos:].lstrip("\n")
+    return output
 
 
 # ---------------------------------------------------------------------------
