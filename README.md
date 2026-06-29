@@ -10,27 +10,29 @@ Point it at any set of subreddits and keywords and it handles scraping, deduplic
 2. **Filters** comments by keyword using regex word-boundary matching
 3. **Deduplicates** across multiple comment sort orders (top + new) per post
 4. **Summarizes** matched comments into a digest organized by topic, with links back to each original comment
-5. **Emails** a styled HTML digest on a daily schedule
-6. **Saves** raw scraped data (JSON) and the final digest (Markdown)
+5. **Evaluates** digest quality — verifies citations, dollar amounts, numeric claims, and completeness against source data
+6. **Emails** a styled HTML digest on a daily schedule
+7. **Stores** run history in SQLite for querying past digests and tracking trends
+8. **Saves** raw scraped data (JSON) and the final digest (Markdown)
 
 ## Example Use Cases
 
-**Credit card deals** - monitor r/churning, r/CreditCards for new offers and data points:
+**Credit card deals** — use the built-in `churning` monitor profile:
 
 ```bash
-python daily_digest.py --subreddits churning,CreditCards,awardtravel --keywords "chase,amex,bonus,SUB,retention"
+python daily_digest.py --monitor churning --db data/monitor.db
 ```
 
-**Tech industry news** - track r/technology, r/programming for developments:
+**Job market monitoring** — use the built-in `job-market` profile:
 
 ```bash
-python daily_digest.py --subreddits technology,programming --keywords "layoff,acquisition,open source,funding,launch" --time week
+python daily_digest.py --monitor job-market --db data/monitor.db
 ```
 
-**Job market monitoring** - watch hiring-related subreddits:
+**Custom one-off run** — pass subreddits and keywords directly:
 
 ```bash
-python daily_digest.py --subreddits cscareerquestions,experienceddevs --keywords "hiring,freeze,remote,return to office,compensation"
+python daily_digest.py --subreddits technology,programming --keywords "layoff,acquisition,open source" --time week
 ```
 
 A sample digest output is included in [`example_digest.md`](example_digest.md).
@@ -38,20 +40,38 @@ A sample digest output is included in [`example_digest.md`](example_digest.md).
 ## Architecture
 
 ```
-┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────┐
+                           ┌──────────────────┐
+                           │ monitor_config.py│
+                           │ (JSON profiles)  │
+                           └────────┬─────────┘
+                                    │
+┌─────────────────────┐     ┌───────▼──────────────┐     ┌──────────────────┐
 │  reddit_scraper.py  │────>│  daily_digest.py     │────>│  NLP Summarizer  │
 │  (HTTP + HTML parse) │     │  (orchestration)     │     │  (themed digest) │
 └─────────────────────┘     └──────────┬───────────┘     └────────┬─────────┘
                                        │                           │
-                              ┌────────▼──────────┐      ┌────────▼────────┐
-                              │  Gmail SMTP       │      │  digest_*.md    │
-                              │  (HTML email)     │      │  digest_*.json  │
-                              └───────────────────┘      └─────────────────┘
+                     ┌─────────────────┼──────────────┐            │
+                     │                 │              │            │
+            ┌────────▼──────┐  ┌───────▼───────┐  ┌──▼────────────▼────┐
+            │  Gmail SMTP   │  │  storage.py   │  │  digest_*.md/json  │
+            │  (HTML email) │  │  (SQLite DB)  │  │  (file output)     │
+            └───────────────┘  └───────────────┘  └──────────┬─────────┘
+                                                             │
+                                                  ┌──────────▼─────────┐
+                                                  │ evaluate_digest.py │
+                                                  │ (quality checks)   │
+                                                  └────────────────────┘
 ```
 
 **`reddit_scraper.py`** - Standalone scraper. Parses old.reddit.com HTML directly, no API key needed. Supports search, subreddit posts, single-post comments, and deep comment search. Handles rate limiting with retry and backoff.
 
-**`daily_digest.py`** - Orchestrator. Fetches comments across configured subreddits, filters by keyword, pipes matches through an LLM summarization step, converts the output to a styled HTML email, and sends it via Gmail SMTP.
+**`daily_digest.py`** - Orchestrator. Fetches comments across configured subreddits, filters by keyword, pipes matches through an LLM summarization step, converts the output to a styled HTML email, and sends it via Gmail SMTP. Supports monitor profiles and SQLite history.
+
+**`monitor_config.py`** - Loads JSON monitor profiles from `config/monitors/`. Validates required fields, applies defaults, and supports the CLI > config > default priority chain.
+
+**`storage.py`** - SQLite storage for run history. Stores metadata, matched comments, keyword match counts, and generated digests with WAL mode for concurrent access.
+
+**`evaluate_digest.py`** - Standalone digest quality checker. Verifies citation coverage, dollar amounts, numeric claims, and completeness against source data.
 
 **`run_digest.bat`** - Windows Task Scheduler wrapper. Runs the digest with timestamped output filenames and logs everything to `digest_run.log`.
 
@@ -84,28 +104,41 @@ python daily_digest.py --posts 15 --time week --save my_digest.md --save-raw raw
 
 ## Configuration
 
-All defaults are at the top of `daily_digest.py` and can be overridden via CLI arguments:
+### Monitor Profiles
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `SUBREDDITS` | *(your list)* | Subreddits to monitor |
-| `KEYWORDS` | *(your list)* | Terms to match in comments (word-boundary regex) |
-| `POSTS_PER_SUB` | 10 | Posts to scan per subreddit |
-| `POST_SORT` | "new" | How to sort posts when fetching |
-| `TIME_FILTER` | "day" | Time window for posts |
-| `POST_TITLE_FILTERS` | regex dict | Optional per-subreddit title filters (e.g., only scrape weekly megathreads) |
+Instead of passing subreddits and keywords every time, define a JSON config in `config/monitors/`:
+
+```bash
+# List available profiles
+python daily_digest.py --list-monitors
+
+# Run with a profile
+python daily_digest.py --monitor churning
+
+# CLI args override profile values
+python daily_digest.py --monitor churning --posts 20 --time week
+```
+
+A profile is a JSON file with subreddits, keywords, title filters, and digest metadata. See `config/monitors/churning.json` for the full format. Create your own by adding a `.json` file to `config/monitors/`.
+
+**Settings priority:** CLI args > monitor config > code defaults.
 
 ### CLI Arguments
 
 ```
 python daily_digest.py [OPTIONS]
 
+  --monitor NAME     Load a monitor profile from config/monitors/
   --posts N          Posts to scan per subreddit (default: 10)
   --time WINDOW      hour | day | week | month | year | all (default: day)
   --save FILE        Save digest to a specific markdown file
   --save-raw FILE    Also save raw scraped comments to JSON
   --subreddits LIST  Override subreddits (comma-separated)
   --keywords LIST    Override keywords (comma-separated)
+  --db PATH          Save run history to a SQLite database
+  --no-db            Skip database storage
+  --history [N]      Show recent runs from the database (default: 10)
+  --list-monitors    List available monitor profiles and exit
 ```
 
 ## Summarization Engine
@@ -149,6 +182,44 @@ The markdown digest is converted to a styled HTML email that renders across Gmai
 - **Inline CSS** - email clients strip `<style>` tags, so styles are applied directly to elements
 - **Markdown preprocessing** inserts blank lines before list blocks so the parser generates correct `<ul>`/`<ol>` tags
 - **Multipart MIME** - sends both plain text and HTML so the recipient's client picks the best format
+
+## Run History (SQLite)
+
+Pass `--db` to store every run's metadata, matched comments, keyword counts, and generated digest in a SQLite database:
+
+```bash
+# Run and save to database
+python daily_digest.py --monitor churning --db data/monitor.db
+
+# View recent runs
+python daily_digest.py --history --db data/monitor.db
+
+# Filter history by monitor
+python daily_digest.py --history --monitor churning --db data/monitor.db
+```
+
+The database uses WAL mode for safe concurrent reads (e.g., querying history while a run is in progress).
+
+## Digest Quality Evaluation
+
+`evaluate_digest.py` checks a generated digest against its source comments to catch LLM hallucinations and omissions:
+
+```bash
+# Evaluate a digest
+python evaluate_digest.py digest_20260628_1830.md digest_20260628_1830.json
+
+# JSON output for programmatic use
+python evaluate_digest.py digest.md raw.json --json
+```
+
+**Checks performed:**
+
+| Check | What it catches |
+|-------|-----------------|
+| Citation coverage | Authors whose comments were used but not attributed |
+| Dollar amounts | Dollar figures in the digest not found in source comments |
+| Numeric claims | Percentages, multipliers, and point/mile amounts the LLM invented |
+| Completeness | High-scoring comments that the digest ignored entirely |
 
 ## Automated Daily Scheduling (Windows)
 
@@ -233,7 +304,7 @@ python -m pytest -q
 python -m ruff check .
 ```
 
-Tests cover HTML parsing, keyword matching, dedup logic, time-window filtering, and markdown email preprocessing. All tests use static fixtures with no network calls.
+115 tests covering HTML parsing, keyword matching, dedup logic, time-window filtering, markdown email preprocessing, config loading/validation, SQLite storage, and digest quality evaluation. All tests use static fixtures with no network calls.
 
 ## Project Structure
 
@@ -241,6 +312,12 @@ Tests cover HTML parsing, keyword matching, dedup logic, time-window filtering, 
 reddit-digest/
 ├── reddit_scraper.py           # Standalone Reddit scraper (no API key needed)
 ├── daily_digest.py             # Digest orchestrator (scrape → summarize → email)
+├── evaluate_digest.py          # Digest quality evaluation (citations, facts, completeness)
+├── monitor_config.py           # Monitor profile loader (JSON configs)
+├── storage.py                  # SQLite run history storage
+├── config/monitors/            # Monitor profiles
+│   ├── churning.json           # Credit card churning monitor
+│   └── job-market.json         # CS job market monitor
 ├── run_digest.bat              # Windows Task Scheduler wrapper
 ├── requirements.txt            # Python dependencies
 ├── requirements-dev.txt        # Dev dependencies (pytest, ruff)
@@ -249,7 +326,7 @@ reddit-digest/
 ├── .env.example                # Environment variable template
 ├── .github/workflows/ci.yml    # GitHub Actions CI (lint + test)
 ├── .gitignore                  # Excludes credentials, outputs, caches
-├── tests/                      # pytest test suite
+├── tests/                      # pytest test suite (115 tests)
 └── README.md                   # This file
 ```
 

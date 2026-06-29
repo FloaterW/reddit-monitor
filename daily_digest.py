@@ -83,8 +83,11 @@ from reddit_scraper import (
 )
 
 
-def _fetch_all_comments(subreddits, posts_per_sub, post_sort, time_filter):
+def _fetch_all_comments(subreddits, posts_per_sub, post_sort, time_filter,
+                        title_filters=None):
     """Fetch comments from recent posts across subreddits (one pass)."""
+    if title_filters is None:
+        title_filters = POST_TITLE_FILTERS
     all_comments = []
 
     for sub in subreddits:
@@ -101,7 +104,7 @@ def _fetch_all_comments(subreddits, posts_per_sub, post_sort, time_filter):
 
         posts = _parse_things(html, posts_per_sub)
 
-        title_pat = POST_TITLE_FILTERS.get(sub)
+        title_pat = title_filters.get(sub)
         if title_pat:
             posts = [p for p in posts if re.search(title_pat, p["title"])]
             print(f"    Found {len(posts)} posts (filtered for title pattern)")
@@ -153,9 +156,12 @@ def _comment_in_window(created_str, cutoff_dt):
         return True
 
 
-def scrape_all(keywords, subreddits, posts_per_sub, time_filter):
+def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
+               post_sort=None, title_filters=None):
     """Fetch all comments once, then filter for any matching keyword."""
-    raw = _fetch_all_comments(subreddits, posts_per_sub, POST_SORT, time_filter)
+    raw = _fetch_all_comments(subreddits, posts_per_sub,
+                              post_sort or POST_SORT, time_filter,
+                              title_filters=title_filters)
     print(f"\n  Total comments fetched: {len(raw)}")
 
     if time_filter == "all":
@@ -461,13 +467,16 @@ def send_email(subject, body_md):
 # ---------------------------------------------------------------------------
 def main():
     import argparse
+    from monitor_config import list_monitors, load_monitor
 
     parser = argparse.ArgumentParser(
         description="Daily Reddit digest — scrape + summarize"
     )
-    parser.add_argument("--posts", type=int, default=POSTS_PER_SUB,
+    parser.add_argument("--monitor", type=str, default=None,
+                        help="Load a monitor profile from config/monitors/ (e.g. churning)")
+    parser.add_argument("--posts", type=int, default=None,
                         help=f"Posts to scan per subreddit (default: {POSTS_PER_SUB})")
-    parser.add_argument("--time", type=str, default=TIME_FILTER,
+    parser.add_argument("--time", type=str, default=None,
                         choices=["hour", "day", "week", "month", "year", "all"],
                         dest="time_filter",
                         help="Time window (default: day)")
@@ -479,19 +488,90 @@ def main():
                         help="Override subreddits (comma-separated)")
     parser.add_argument("--keywords", type=str, default=None,
                         help="Override keywords (comma-separated)")
+    parser.add_argument("--db", type=str, default=None,
+                        help="Save run history to a SQLite database (e.g. data/reddit_monitor.db)")
+    parser.add_argument("--no-db", action="store_true",
+                        help="Skip database storage even if --db was previously used")
+    parser.add_argument("--list-monitors", action="store_true",
+                        help="List available monitor profiles and exit")
+    parser.add_argument("--history", type=int, nargs="?", const=10, default=None,
+                        help="Show recent runs from the database and exit (default: 10)")
     args = parser.parse_args()
 
-    subs = [s.strip() for s in args.subreddits.split(",")] if args.subreddits else SUBREDDITS
-    kws = [k.strip() for k in args.keywords.split(",")] if args.keywords else KEYWORDS
+    if args.list_monitors:
+        monitors = list_monitors()
+        if monitors:
+            print("Available monitors:")
+            for m in monitors:
+                print(f"  {m}")
+        else:
+            print("No monitor profiles found in config/monitors/")
+        return
+
+    if args.history is not None:
+        if not args.db:
+            print("ERROR: --history requires --db <path>")
+            sys.exit(1)
+        from storage import DigestDB
+        monitor_filter = None
+        if args.monitor:
+            from monitor_config import load_monitor
+            monitor_filter = load_monitor(args.monitor)["name"]
+        db = DigestDB(args.db)
+        runs = db.get_runs(limit=args.history, monitor_name=monitor_filter)
+        db.close()
+        if not runs:
+            print("No runs recorded yet.")
+            return
+        print(f"{'ID':>4}  {'Monitor':<25} {'Date':<22} {'Matched':>7}  {'Time'}")
+        print("-" * 75)
+        for r in runs:
+            started = r["started_at"][:19].replace("T", " ")
+            print(f"{r['id']:>4}  {r['monitor_name']:<25} {started:<22} "
+                  f"{r['matched_comment_count']:>7}  {r['time_filter']}")
+        return
+
+    # Resolve settings: CLI args > monitor config > code defaults
+    monitor = None
+    if args.monitor:
+        try:
+            monitor = load_monitor(args.monitor)
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+
+    if args.subreddits:
+        subs = [s.strip() for s in args.subreddits.split(",")]
+    elif monitor:
+        subs = monitor["subreddits"]
+    else:
+        subs = SUBREDDITS
+
+    if args.keywords:
+        kws = [k.strip() for k in args.keywords.split(",")]
+    elif monitor:
+        kws = monitor["keywords"]
+    else:
+        kws = KEYWORDS
+
+    posts = args.posts if args.posts is not None else (monitor["posts_per_subreddit"] if monitor else POSTS_PER_SUB)
+    tf = args.time_filter if args.time_filter is not None else (monitor["time_filter"] if monitor else TIME_FILTER)
+    post_sort = monitor["post_sort"] if monitor else POST_SORT
+    title_filters = monitor.get("title_filters", {}) if monitor else POST_TITLE_FILTERS
+    digest_meta = monitor.get("digest", {}) if monitor else {}
+    digest_title = digest_meta.get("title", "Churning Digest")
 
     print("=" * 60)
     print(f"  DAILY REDDIT DIGEST — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if monitor:
+        print(f"  Monitor: {monitor['name']}")
     print(f"  Subreddits: {', '.join('r/' + s for s in subs)}")
     print(f"  Keywords: {', '.join(kws)}")
-    print(f"  Time window: {args.time_filter}")
+    print(f"  Time window: {tf}")
     print("=" * 60)
 
-    comments = scrape_all(kws, subs, args.posts, args.time_filter)
+    comments = scrape_all(kws, subs, posts, tf,
+                          post_sort=post_sort, title_filters=title_filters)
 
     if not comments:
         print("\nNo comments found. Nothing to summarize.")
@@ -509,7 +589,7 @@ def main():
     time_label = {"hour": "hour", "day": "24 hours", "week": "week",
                   "month": "month", "year": "year", "all": "all time"}
     try:
-        summary = summarize(comments, time_label.get(args.time_filter, "24 hours"))
+        summary = summarize(comments, time_label.get(tf, "24 hours"))
     except RuntimeError as e:
         print(f"\nERROR: {e}")
         print("Raw data was saved — rerun with a longer timeout or fewer posts.")
@@ -518,18 +598,36 @@ def main():
     print("\n" + summary)
 
     if args.save:
-        with open(args.save, "w", encoding="utf-8") as f:
-            f.write(summary)
-        print(f"\n[OK] Summary saved to: {args.save}")
+        digest_path = args.save
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        default_path = f"digest_{stamp}.md"
-        with open(default_path, "w", encoding="utf-8") as f:
-            f.write(summary)
-        print(f"\n[OK] Summary saved to: {default_path}")
+        digest_path = f"digest_{stamp}.md"
+
+    with open(digest_path, "w", encoding="utf-8") as f:
+        f.write(summary)
+    print(f"\n[OK] Summary saved to: {digest_path}")
 
     date_str = datetime.now().strftime("%B %d, %Y")
-    send_email(f"Churning Digest — {date_str}", summary)
+    send_email(f"{digest_title} — {date_str}", summary)
+
+    # Save to database if requested
+    if args.db and not args.no_db:
+        from storage import DigestDB
+        db = DigestDB(args.db)
+        try:
+            monitor_name = monitor["name"] if monitor else "default"
+            run_id = db.save_run(
+                monitor_name=monitor_name,
+                time_filter=tf,
+                posts_per_subreddit=posts,
+                comments=comments,
+                digest_md=summary,
+                digest_path=digest_path,
+                raw_json_path=args.save_raw,
+            )
+            print(f"[OK] Run #{run_id} saved to database: {args.db}")
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

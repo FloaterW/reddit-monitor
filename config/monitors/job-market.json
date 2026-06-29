@@ -1,0 +1,21 @@
+{
+  "name": "job-market-watch",
+  "description": "Monitors CS career discussions for hiring trends, compensation data, and market shifts.",
+  "subreddits": ["cscareerquestions", "experienceddevs", "csMajors"],
+  "keywords": [
+    "hiring", "freeze", "layoff",
+    "remote", "return to office", "RTO", "hybrid",
+    "compensation", "salary", "TC",
+    "offer", "negotiation",
+    "new grad", "entry level", "junior",
+    "interview", "leetcode", "system design"
+  ],
+  "post_sort": "new",
+  "time_filter": "day",
+  "posts_per_subreddit": 10,
+  "title_filters": {},
+  "digest": {
+    "title": "Job Market Digest",
+    "audience": "software engineers and CS students tracking the job market"
+  }
+}

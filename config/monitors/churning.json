@@ -1,0 +1,26 @@
+{
+  "name": "credit-card-churning",
+  "description": "Tracks credit-card rewards, churning data points, bank bonuses, and award travel.",
+  "subreddits": ["churning", "CreditCards", "awardtravel", "churningcanada"],
+  "keywords": [
+    "chase", "amex", "citi", "capital one",
+    "sapphire", "ink",
+    "CIP", "CIC", "CSR", "CSP", "CIU",
+    "c1", "vx", "bonvoy",
+    "SUB", "bonus", "retention",
+    "paze", "bilt", "palladium",
+    "hyatt", "hilton", "marriott",
+    "boa", "alaska", "summit",
+    "5/24"
+  ],
+  "post_sort": "new",
+  "time_filter": "day",
+  "posts_per_subreddit": 10,
+  "title_filters": {
+    "churningcanada": "(?i)data\\s*point\\s*weekly|US\\s*churning\\s*discussion"
+  },
+  "digest": {
+    "title": "Churning Digest",
+    "audience": "credit card churning and award travel enthusiasts"
+  }
+}
