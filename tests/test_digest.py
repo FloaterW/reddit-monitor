@@ -7,6 +7,7 @@ from unittest.mock import patch
 from daily_digest import (
     _comment_in_window,
     _preprocess_md,
+    _wrap_html_email,
     format_comments_for_prompt,
     scrape_all,
     summarize,
@@ -182,3 +183,67 @@ class TestSummarizeErrors:
                                  "matched_keywords": [], "depth": 0, "parent_id": "",
                                  "post_permalink": ""}])
             assert result == digest
+
+
+# ---------------------------------------------------------------------------
+# Monitor config propagation into the summarization prompt
+# ---------------------------------------------------------------------------
+class TestPromptMonitorPropagation:
+    def _capture_prompt(self, **kwargs):
+        captured = {}
+
+        def fake_run(cmd, **run_kwargs):
+            captured["prompt"] = run_kwargs.get("input", "")
+            return subprocess.CompletedProcess(args=cmd, returncode=0,
+                                               stdout="# Digest", stderr="")
+
+        comment = {"body": "test", "subreddit": "t", "post_title": "t",
+                   "author": "a", "score": 0, "created": "", "id": "",
+                   "matched_keywords": [], "depth": 0, "parent_id": "",
+                   "post_permalink": ""}
+        with patch("subprocess.run", side_effect=fake_run):
+            summarize([comment], **kwargs)
+        return captured["prompt"]
+
+    def test_default_prompt_is_churning(self):
+        prompt = self._capture_prompt()
+        assert "credit card churning and award travel enthusiasts" in prompt
+        assert "r/churning, r/CreditCards, r/awardtravel, and r/churningcanada" in prompt
+        assert "Monitor focus:" not in prompt
+
+    def test_job_market_monitor_values_reach_prompt(self):
+        from monitor_config import load_monitor
+        cfg = load_monitor("job-market")
+        prompt = self._capture_prompt(
+            audience=cfg["digest"]["audience"],
+            monitor_name=cfg["name"],
+            description=cfg["description"],
+            subreddits=cfg["subreddits"],
+        )
+        assert "software engineers and CS students tracking the job market" in prompt
+        assert "r/cscareerquestions" in prompt
+        assert "job-market-watch" in prompt
+        assert "churning" not in prompt
+
+    def test_explicit_subreddits_used_in_prompt(self):
+        prompt = self._capture_prompt(subreddits=["python"])
+        assert "scraped from r/python in" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Email wrapper header/footer
+# ---------------------------------------------------------------------------
+class TestEmailWrapper:
+    def test_header_uses_provided_subreddits(self):
+        html = _wrap_html_email("<p>x</p>", "Job Digest",
+                                subreddits=["cscareerquestions", "experienceddevs"])
+        assert "Auto-generated from r/cscareerquestions, r/experienceddevs" in html
+        assert "r/churning" not in html
+
+    def test_header_defaults_to_churning_subreddits(self):
+        html = _wrap_html_email("<p>x</p>", "Churning Digest")
+        assert "r/churning" in html
+
+    def test_no_hardcoded_delivery_time(self):
+        html = _wrap_html_email("<p>x</p>", "Digest")
+        assert "6:30" not in html

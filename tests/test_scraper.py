@@ -4,6 +4,7 @@ from reddit_scraper import (
     _dedup_key,
     _matches_query,
     _parse_comments,
+    _parse_retry_after,
     _parse_search_results,
     _parse_things,
     _strip_html,
@@ -151,6 +152,52 @@ class TestDedupKey:
         c2 = {"id": "", "author": "bob", "body": "Second comment",
               "created": "2025-06-24 12:05 UTC", "post_permalink": shared}
         assert _dedup_key(c1) != _dedup_key(c2)
+
+
+# ---------------------------------------------------------------------------
+# Retry-After parsing
+# ---------------------------------------------------------------------------
+class TestParseRetryAfter:
+    def test_numeric_seconds(self):
+        assert _parse_retry_after("30") == 30
+
+    def test_capped_at_120(self):
+        assert _parse_retry_after("999") == 120
+
+    def test_http_date_falls_back(self):
+        assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT") == 60
+
+    def test_missing_header_falls_back(self):
+        assert _parse_retry_after(None) == 60
+
+    def test_negative_clamped_to_zero(self):
+        assert _parse_retry_after("-5") == 0
+
+
+class _FakeResponse:
+    def __init__(self, status_code, text="", headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        pass
+
+
+class TestFetchRetryAfter:
+    def test_malformed_retry_after_does_not_crash(self, monkeypatch):
+        import reddit_scraper as rs
+
+        responses = [
+            _FakeResponse(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            _FakeResponse(200, text="<html>ok</html>"),
+        ]
+        monkeypatch.setattr(rs._SESSION, "get", lambda *a, **k: responses.pop(0))
+        sleeps = []
+        monkeypatch.setattr(rs.time, "sleep", lambda s: sleeps.append(s))
+
+        assert rs._fetch("/r/test/") == "<html>ok</html>"
+        assert sleeps == [60]
 
 
 # ---------------------------------------------------------------------------

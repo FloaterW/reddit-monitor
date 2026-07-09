@@ -201,12 +201,24 @@ def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
 # ---------------------------------------------------------------------------
 # Summarisation
 # ---------------------------------------------------------------------------
-SUMMARY_PROMPT = """\
-You are a credit card churning and award travel analyst. Below are Reddit comments \
-scraped from r/churning, r/CreditCards, r/awardtravel, and r/churningcanada in the \
-last {time_window}.
+DEFAULT_AUDIENCE = "credit card churning and award travel enthusiasts"
 
-Your job: produce a **Daily Digest** that someone in the churning community would \
+
+def _format_subreddit_list(subreddits):
+    """['a', 'b', 'c'] -> 'r/a, r/b, and r/c' for use in prose."""
+    names = [f"r/{s}" for s in subreddits]
+    if not names:
+        return "Reddit"
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f", and {names[-1]}"
+
+
+SUMMARY_PROMPT = """\
+You are an analyst writing a digest for {audience}. Below are Reddit comments \
+scraped from {subreddit_list} in the last {time_window}.{focus_line}
+
+Your job: produce a **Daily Digest** that {audience} would \
 find valuable. Organize by theme, not by subreddit or keyword.
 
 Rules:
@@ -273,11 +285,18 @@ def format_comments_for_prompt(comments):
     return "\n".join(lines)
 
 
-def summarize(comments, time_window="24 hours"):
+def summarize(comments, time_window="24 hours", audience=None,
+              monitor_name=None, description=None, subreddits=None):
+    focus_parts = [p for p in (monitor_name, description) if p]
+    focus_line = f"\nMonitor focus: {' — '.join(focus_parts)}" if focus_parts else ""
+
     prompt_text = SUMMARY_PROMPT.format(
         time_window=time_window,
         count=len(comments),
         comments=format_comments_for_prompt(comments),
+        audience=audience or DEFAULT_AUDIENCE,
+        subreddit_list=_format_subreddit_list(subreddits if subreddits is not None else SUBREDDITS),
+        focus_line=focus_line,
     )
 
     print(f"\nSending {len(comments)} comments for summarization...\n")
@@ -350,8 +369,9 @@ def _preprocess_md(md_text):
     return "\n".join(out)
 
 
-def _wrap_html_email(inner_html, title):
+def _wrap_html_email(inner_html, title, subreddits=None):
     """Wrap converted markdown in a styled email template."""
+    subs_line = ", ".join(f"r/{s}" for s in (subreddits or SUBREDDITS))
     return f"""\
 <!DOCTYPE html>
 <html>
@@ -371,7 +391,7 @@ def _wrap_html_email(inner_html, title):
             {title}
           </h1>
           <p style="margin:6px 0 0;color:#a0aec0;font-size:13px">
-            Auto-generated from r/churning, r/CreditCards, r/awardtravel, r/churningcanada
+            Auto-generated from {subs_line}
           </p>
         </td></tr>
         <!-- Body -->
@@ -381,7 +401,7 @@ def _wrap_html_email(inner_html, title):
         <!-- Footer -->
         <tr><td style="padding:20px 32px;border-top:1px solid #e2e8f0;
                        font-size:12px;color:#a0aec0;text-align:center">
-          Reddit Digest &middot; Delivered daily at 6:30 PM
+          Reddit Digest &middot; Automated summary
         </td></tr>
       </table>
     </td></tr>
@@ -421,7 +441,7 @@ def _inline_styles(html):
     return html
 
 
-def send_email(subject, body_md):
+def send_email(subject, body_md, subreddits=None):
     """Send the digest as an HTML email via Gmail SMTP."""
     if not GMAIL_APP_PASSWORD:
         print("[SKIP] No Gmail app password configured — email not sent.")
@@ -442,7 +462,7 @@ def send_email(subject, body_md):
         inner = f"<pre style='font-family:sans-serif;white-space:pre-wrap'>{body_md}</pre>"
 
     inner = _inline_styles(inner)
-    html_body = _wrap_html_email(inner, subject)
+    html_body = _wrap_html_email(inner, subject, subreddits=subreddits)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -589,7 +609,14 @@ def main():
     time_label = {"hour": "hour", "day": "24 hours", "week": "week",
                   "month": "month", "year": "year", "all": "all time"}
     try:
-        summary = summarize(comments, time_label.get(tf, "24 hours"))
+        summary = summarize(
+            comments,
+            time_label.get(tf, "24 hours"),
+            audience=digest_meta.get("audience"),
+            monitor_name=monitor["name"] if monitor else None,
+            description=monitor.get("description") if monitor else None,
+            subreddits=subs,
+        )
     except RuntimeError as e:
         print(f"\nERROR: {e}")
         print("Raw data was saved — rerun with a longer timeout or fewer posts.")
@@ -608,7 +635,7 @@ def main():
     print(f"\n[OK] Summary saved to: {digest_path}")
 
     date_str = datetime.now().strftime("%B %d, %Y")
-    send_email(f"{digest_title} — {date_str}", summary)
+    send_email(f"{digest_title} — {date_str}", summary, subreddits=subs)
 
     # Save to database if requested
     if args.db and not args.no_db:

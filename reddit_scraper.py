@@ -61,6 +61,19 @@ _SESSION.headers.update({
 _BASE = "https://old.reddit.com"
 
 
+def _parse_retry_after(value, default=60):
+    """Parse a Retry-After header value into seconds.
+
+    Reddit sends integer seconds, but the HTTP spec also allows an HTTP-date.
+    Non-numeric values fall back to the default instead of crashing the run.
+    """
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(seconds, 0), 120)
+
+
 def _fetch(path, params=None):
     url = f"{_BASE}{path}"
     for attempt in range(3):
@@ -74,7 +87,7 @@ def _fetch(path, params=None):
             return None
 
         if resp.status_code == 429:
-            wait = min(int(resp.headers.get("Retry-After", 60)), 120)
+            wait = _parse_retry_after(resp.headers.get("Retry-After"))
             print(f"  Rate limited - waiting {wait}s...")
             time.sleep(wait)
             continue

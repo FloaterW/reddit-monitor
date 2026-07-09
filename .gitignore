@@ -2,6 +2,9 @@
 .env
 .gmail_app_password
 
+# Private planning docs — local only, never publish
+COMMUNITY_INTELLIGENCE_ROADMAP.md
+
 # Scraper output
 *_results.json
 *_comments.json
