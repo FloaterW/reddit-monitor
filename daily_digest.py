@@ -64,6 +64,13 @@ TIME_FILTER = "day"
 LLM_COMMAND = os.getenv("DIGEST_LLM_COMMAND", "claude")
 LLM_MODEL = os.getenv("DIGEST_LLM_MODEL", "claude-sonnet-4-6")
 
+# Seconds to wait for the summarization call. A typical run takes ~4 minutes,
+# but the CLI can be markedly slower right after re-authenticating.
+try:
+    LLM_TIMEOUT = int(os.getenv("DIGEST_LLM_TIMEOUT", "1200"))
+except ValueError:
+    LLM_TIMEOUT = 1200
+
 # Email — leave GMAIL_APP_PASSWORD empty to skip emailing.
 # Generate an app password at https://myaccount.google.com/apppasswords
 EMAIL_TO = os.getenv("DIGEST_EMAIL_TO", "your_email@gmail.com")
@@ -311,7 +318,7 @@ def summarize(comments, time_window="24 hours", audience=None,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=600,
+            timeout=LLM_TIMEOUT,
         )
     except FileNotFoundError:
         raise RuntimeError(
@@ -321,18 +328,37 @@ def summarize(comments, time_window="24 hours", audience=None,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            "Summarization timed out after 10 minutes. "
-            "Try reducing --posts or narrowing the --time window."
+            f"Summarization timed out after {LLM_TIMEOUT // 60} minutes. "
+            f"Try reducing --posts, narrowing the --time window, or raising "
+            f"DIGEST_LLM_TIMEOUT in your .env file."
         )
 
     if result.returncode != 0:
+        # The CLI reports some failures (e.g. expired OAuth token) on stdout
+        # rather than stderr, so surface both before guessing at the cause.
         stderr = result.stderr.strip()
-        raise RuntimeError(
+        stdout = result.stdout.strip()
+        details = "\n".join(
+            f"  {label}: {text}"
+            for label, text in (("stderr", stderr), ("stdout", stdout))
+            if text
+        )
+        message = (
             f"LLM command exited with code {result.returncode}.\n"
             f"  Command: {' '.join(cmd)}\n"
-            f"  Error: {stderr or '(no stderr output)'}\n"
-            f"  Check that '{LLM_COMMAND}' is installed and '{LLM_MODEL}' is a valid model."
+            f"{details or '  (no output captured)'}"
         )
+        if "authenticat" in f"{stderr}\n{stdout}".lower():
+            message += (
+                f"\n  Re-authenticate with '{LLM_COMMAND}' (run it interactively "
+                f"and use /login), then rerun the digest."
+            )
+        else:
+            message += (
+                f"\n  Check that '{LLM_COMMAND}' is installed and "
+                f"'{LLM_MODEL}' is a valid model."
+            )
+        raise RuntimeError(message)
 
     output = result.stdout.strip()
     heading_pos = output.find("\n# ")
@@ -504,6 +530,9 @@ def main():
                         help="Save summary to a markdown file")
     parser.add_argument("--save-raw", type=str, default=None,
                         help="Also save raw scraped comments to JSON")
+    parser.add_argument("--from-json", type=str, default=None,
+                        help="Resume from a previously saved raw JSON file "
+                             "instead of scraping Reddit again")
     parser.add_argument("--subreddits", type=str, default=None,
                         help="Override subreddits (comma-separated)")
     parser.add_argument("--keywords", type=str, default=None,
@@ -590,15 +619,30 @@ def main():
     print(f"  Time window: {tf}")
     print("=" * 60)
 
-    comments = scrape_all(kws, subs, posts, tf,
-                          post_sort=post_sort, title_filters=title_filters)
+    if args.from_json:
+        raw_path = Path(args.from_json)
+        if not raw_path.exists():
+            print(f"ERROR: --from-json file not found: {raw_path}")
+            sys.exit(1)
+        try:
+            with open(raw_path, encoding="utf-8") as f:
+                comments = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"ERROR: could not read {raw_path}: {e}")
+            sys.exit(1)
+        print(f"\n[OK] Loaded {len(comments)} comments from {raw_path} "
+              f"(skipping scrape)")
+    else:
+        comments = scrape_all(kws, subs, posts, tf,
+                              post_sort=post_sort, title_filters=title_filters)
 
     if not comments:
         print("\nNo comments found. Nothing to summarize.")
         return
 
+    verb = "Loaded" if args.from_json else "Scraped"
     print(f"\n{'=' * 60}")
-    print(f"  Scraped {len(comments)} unique comments. Summarizing...")
+    print(f"  {verb} {len(comments)} unique comments. Summarizing...")
     print(f"{'=' * 60}")
 
     if args.save_raw:

@@ -73,7 +73,9 @@ A sample digest output is included in [`example_digest.md`](example_digest.md).
 
 **`evaluate_digest.py`** - Standalone digest quality checker. Verifies citation coverage, dollar amounts, numeric claims, and completeness against source data.
 
-**`run_digest.bat`** - Windows Task Scheduler wrapper. Runs the digest with timestamped output filenames and logs everything to `digest_run.log`.
+**`run_digest.bat`** - Windows Task Scheduler wrapper. Runs the digest with timestamped output filenames and logs everything to `digest_run.log`. If the run exits non-zero, it calls `notify_failure.py` so the failure reaches your inbox instead of sitting silently in the log.
+
+**`notify_failure.py`** - Emails a failure alert with the tail of `digest_run.log`, the exit code, and recovery steps. Never changes the run's exit code, even if the alert itself cannot be sent.
 
 ## Prerequisites
 
@@ -133,6 +135,7 @@ python daily_digest.py [OPTIONS]
   --time WINDOW      hour | day | week | month | year | all (default: day)
   --save FILE        Save digest to a specific markdown file
   --save-raw FILE    Also save raw scraped comments to JSON
+  --from-json FILE   Resume from saved raw JSON instead of re-scraping
   --subreddits LIST  Override subreddits (comma-separated)
   --keywords LIST    Override keywords (comma-separated)
   --db PATH          Save run history to a SQLite database
@@ -151,6 +154,7 @@ The digest uses an LLM to summarize scraped comments into a themed digest. It sh
 |----------|---------|-------------|
 | `DIGEST_LLM_COMMAND` | `claude` | CLI executable for summarization |
 | `DIGEST_LLM_MODEL` | `claude-sonnet-4-6` | Model name passed via `--model` |
+| `DIGEST_LLM_TIMEOUT` | `1200` | Seconds to wait for summarization |
 
 Any CLI that accepts `-p --model <name>` with stdin/stdout works as a drop-in replacement. If the CLI is missing, the pipeline gives a clear error instead of a traceback.
 
@@ -319,6 +323,7 @@ reddit-digest/
 │   ├── churning.json           # Credit card churning monitor
 │   └── job-market.json         # CS job market monitor
 ├── run_digest.bat              # Windows Task Scheduler wrapper
+├── notify_failure.py           # Emails an alert when a scheduled run fails
 ├── requirements.txt            # Python dependencies
 ├── requirements-dev.txt        # Dev dependencies (pytest, ruff)
 ├── pyproject.toml              # Project config (pytest, ruff settings)

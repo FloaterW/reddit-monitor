@@ -13,5 +13,11 @@ echo [%date% %time%] Starting digest run... >> digest_run.log
 python daily_digest.py --monitor churning --save "digest_%STAMP%.md" --save-raw "digest_%STAMP%.json" --db data/monitor.db >> digest_run.log 2>&1
 set EXITCODE=%ERRORLEVEL%
 echo [%date% %time%] Finished with exit code %EXITCODE% >> digest_run.log
+
+if %EXITCODE% neq 0 (
+    echo [%date% %time%] Sending failure alert... >> digest_run.log
+    python notify_failure.py %EXITCODE% digest_run.log >> digest_run.log 2>&1
+)
+
 echo. >> digest_run.log
 exit /b %EXITCODE%
