@@ -34,6 +34,10 @@ import os
 import re
 import sys
 import time
+try:
+    import defusedxml.ElementTree as ET
+except ImportError:
+    import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html import unescape
 from urllib.parse import urlparse
@@ -84,6 +88,9 @@ def _fetch(path, params=None):
             return None
         except requests.Timeout:
             print("  WARNING: Reddit request timed out — skipping this request.")
+            return None
+
+        if "/login" in getattr(resp, "url", ""):
             return None
 
         if resp.status_code == 429:
@@ -552,6 +559,164 @@ def save_to_json(data, filename) -> bool:
         return False
     print(f"[OK] Results saved to: {filename}")
     return True
+
+
+# ---------------------------------------------------------------------------
+# RSS-based fetching (fallback when old.reddit.com requires login)
+# ---------------------------------------------------------------------------
+
+_RSS_BASE = "https://www.reddit.com"
+_RSS_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+_RSS_SESSION = requests.Session()
+_RSS_SESSION.headers.update({
+    "User-Agent": "reddit-digest:v1.0 (automated; personal use)",
+})
+
+
+def _fetch_rss(path, params=None):
+    """Fetch an RSS/Atom feed and return the XML root element, or None."""
+    url = f"{_RSS_BASE}{path}"
+    for attempt in range(5):
+        try:
+            resp = _RSS_SESSION.get(url, params=params, timeout=20)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt < 4:
+                time.sleep(3 * (attempt + 1))
+                continue
+            return None
+
+        if resp.status_code == 429:
+            wait = _parse_retry_after(
+                resp.headers.get("Retry-After"), 15 + 10 * attempt,
+            )
+            print(f"    RSS rate limited — waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        if resp.status_code != 200:
+            return None
+
+        try:
+            return ET.fromstring(resp.content)
+        except ET.ParseError:
+            return None
+
+    return None
+
+
+def _rss_entry_to_comment(entry):
+    """Convert an RSS Atom entry into the same dict format as _parse_comments."""
+    author_el = entry.find("atom:author/atom:name", _RSS_NS)
+    author_raw = author_el.text if author_el is not None else ""
+    author = author_raw.removeprefix("/u/") if author_raw else ""
+
+    link_el = entry.find("atom:link", _RSS_NS)
+    permalink = link_el.get("href", "") if link_el is not None else ""
+
+    updated = entry.findtext("atom:updated", "", _RSS_NS)
+    entry_id = entry.findtext("atom:id", "", _RSS_NS)
+    content_html = entry.findtext("atom:content", "", _RSS_NS)
+    body = _truncate(_strip_html(content_html), 500) if content_html else ""
+
+    parts = permalink.rstrip("/").split("/")
+    subreddit = post_id = post_slug = ""
+    try:
+        r_idx = parts.index("r")
+        subreddit = parts[r_idx + 1]
+        c_idx = parts.index("comments")
+        post_id = parts[c_idx + 1]
+        post_slug = parts[c_idx + 2]
+    except (ValueError, IndexError):
+        pass
+
+    post_permalink = ""
+    if subreddit and post_id and post_slug:
+        post_permalink = (
+            f"https://reddit.com/r/{subreddit}/comments/{post_id}/{post_slug}/"
+        )
+
+    post_title = post_slug.replace("_", " ").title() if post_slug else ""
+
+    return {
+        "id": entry_id,
+        "author": _author_name(author),
+        "score": 0,
+        "body": body,
+        "created": _parse_iso_time(updated),
+        "depth": 0,
+        "parent_id": "",
+        "subreddit": subreddit,
+        "post_title": post_title,
+        "post_permalink": post_permalink,
+        "_post_id": post_id,
+    }
+
+
+def fetch_subreddit_comments_rss(subreddit, max_pages=3, per_page=100):
+    """Fetch recent comments from a subreddit via RSS with pagination."""
+    all_comments = []
+    after = None
+
+    for page in range(max_pages):
+        params = {"limit": per_page}
+        if after:
+            params["after"] = after
+
+        root = _fetch_rss(f"/r/{subreddit}/comments/.rss", params)
+        if root is None:
+            break
+
+        entries = root.findall("atom:entry", _RSS_NS)
+        if not entries:
+            break
+
+        for e in entries:
+            all_comments.append(_rss_entry_to_comment(e))
+
+        after = entries[-1].findtext("atom:id", None, _RSS_NS)
+        if not after or len(entries) < per_page:
+            break
+
+        time.sleep(5)
+
+    return all_comments
+
+
+def fetch_subreddit_posts_rss(subreddit, limit=25):
+    """Fetch post titles from a subreddit via RSS.
+
+    Returns a dict mapping post_id -> title for enriching comment data.
+    """
+    params = {"limit": limit}
+    root = _fetch_rss(f"/r/{subreddit}/.rss", params)
+    if root is None:
+        return {}
+
+    titles = {}
+    for entry in root.findall("atom:entry", _RSS_NS):
+        entry_id = entry.findtext("atom:id", "", _RSS_NS)
+        title = entry.findtext("atom:title", "", _RSS_NS)
+        post_id = entry_id.removeprefix("t3_")
+        if post_id and title:
+            titles[post_id] = title
+
+    return titles
+
+
+def old_reddit_available():
+    """Check whether old.reddit.com serves content without requiring login."""
+    try:
+        resp = _SESSION.get(
+            f"{_BASE}/r/all/new/",
+            params={"limit": 1},
+            timeout=10,
+            allow_redirects=False,
+        )
+        if resp.status_code in (301, 302):
+            return "/login" not in resp.headers.get("Location", "")
+        return resp.status_code == 200
+    except (requests.ConnectionError, requests.Timeout):
+        return False
 
 
 # ---------------------------------------------------------------------------

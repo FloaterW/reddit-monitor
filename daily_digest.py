@@ -87,7 +87,46 @@ if _pw_file.exists():
 # ---------------------------------------------------------------------------
 from reddit_scraper import (
     _dedup_key, _fetch, _matches_query, _parse_comments, _parse_things,
+    fetch_subreddit_comments_rss, fetch_subreddit_posts_rss,
+    old_reddit_available,
 )
+
+
+def _fetch_all_comments_rss(subreddits, title_filters):
+    """Fetch comments via RSS when old.reddit.com is inaccessible."""
+    all_comments = []
+
+    for sub in subreddits:
+        print(f"\n  Fetching r/{sub} comments via RSS...")
+
+        post_titles = fetch_subreddit_posts_rss(sub)
+        time.sleep(5)
+
+        comments = fetch_subreddit_comments_rss(sub)
+
+        for c in comments:
+            pid = c.pop("_post_id", "")
+            if pid and pid in post_titles:
+                c["post_title"] = post_titles[pid]
+
+        title_pat = title_filters.get(sub)
+        if title_pat:
+            before = len(comments)
+            comments = [
+                c for c in comments
+                if re.search(title_pat, c.get("post_title", ""), re.IGNORECASE)
+            ]
+            print(f"    Fetched {len(comments)} comments "
+                  f"(title-filtered from {before})")
+        else:
+            print(f"    Fetched {len(comments)} comments")
+
+        all_comments.extend(comments)
+
+        if sub != subreddits[-1]:
+            time.sleep(4)
+
+    return all_comments
 
 
 def _fetch_all_comments(subreddits, posts_per_sub, post_sort, time_filter,
@@ -95,6 +134,11 @@ def _fetch_all_comments(subreddits, posts_per_sub, post_sort, time_filter,
     """Fetch comments from recent posts across subreddits (one pass)."""
     if title_filters is None:
         title_filters = POST_TITLE_FILTERS
+
+    if not old_reddit_available():
+        print("\n  old.reddit.com requires login — using RSS feeds.")
+        return _fetch_all_comments_rss(subreddits, title_filters)
+
     all_comments = []
 
     for sub in subreddits:
