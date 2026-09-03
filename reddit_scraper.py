@@ -34,10 +34,13 @@ import os
 import re
 import sys
 import time
+
 try:
     import defusedxml.ElementTree as ET
-except ImportError:
-    import xml.etree.ElementTree as ET
+except ImportError as exc:  # pragma: no cover - dependency installation failure
+    raise RuntimeError(
+        "defusedxml is required for safe RSS parsing; install requirements.txt"
+    ) from exc
 from datetime import datetime, timezone
 from html import unescape
 from urllib.parse import urlparse

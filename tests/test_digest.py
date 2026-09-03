@@ -5,10 +5,14 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from daily_digest import (
+    _build_llm_command,
+    _chunk_comments,
     _comment_in_window,
+    _markdown_to_safe_html,
     _preprocess_md,
     _wrap_html_email,
     format_comments_for_prompt,
+    sanitize_digest_markdown,
     scrape_all,
     summarize,
 )
@@ -247,3 +251,53 @@ class TestEmailWrapper:
     def test_no_hardcoded_delivery_time(self):
         html = _wrap_html_email("<p>x</p>", "Digest")
         assert "6:30" not in html
+
+
+class TestLLMSecurityBoundary:
+    def test_claude_runs_without_tools_or_settings(self):
+        with patch("daily_digest._resolve_llm_executable", return_value="claude"):
+            cmd = _build_llm_command()
+
+        assert cmd[cmd.index("--tools") + 1] == ""
+        assert cmd[cmd.index("--setting-sources") + 1] == ""
+        assert "--strict-mcp-config" in cmd
+        assert "--append-system-prompt" in cmd
+
+    def test_sanitizer_removes_active_and_external_content(self):
+        unsafe = (
+            "# Digest\n"
+            "![beacon](https://evil.example/track)\n"
+            "[bad](https://evil.example/phish)\n"
+            "[good](https://reddit.com/r/test/comments/abc/post/def/)\n"
+            "<script>alert(1)</script>"
+        )
+        cleaned = sanitize_digest_markdown(unsafe)
+
+        assert "![" not in cleaned
+        assert "evil.example" not in cleaned
+        assert "https://reddit.com/" in cleaned
+        assert "<script>" not in cleaned
+
+    def test_email_html_allowlist_blocks_active_content(self):
+        rendered = _markdown_to_safe_html(
+            "<img src=https://evil.example/x>\n"
+            "<form action=https://evil.example><input></form>\n"
+            "[source](https://reddit.com/r/test/comments/a/b/c/)"
+        )
+
+        assert "<img" not in rendered
+        assert "<form" not in rendered
+        assert "evil.example" not in rendered
+        assert "https://reddit.com/" in rendered
+
+    def test_chunking_never_drops_comments(self):
+        comments = [
+            {"id": f"t1_{i}", "body": "x" * 5000, "author": "a"}
+            for i in range(30)
+        ]
+        with patch("daily_digest.LLM_MAX_INPUT_CHARS", 10_000):
+            chunks = _chunk_comments(comments)
+
+        flattened = [comment for chunk in chunks for comment in chunk]
+        assert flattened == comments
+        assert len(chunks) > 1
