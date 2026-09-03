@@ -107,6 +107,62 @@ class TestLoadMonitor:
         with pytest.raises(ValueError, match="non-empty list"):
             load_monitor("empty")
 
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("subreddits", [""], "non-empty strings"),
+            ("keywords", [1], "non-empty strings"),
+            ("post_sort", "invalid", "post_sort"),
+            ("time_filter", "decade", "time_filter"),
+            ("posts_per_subreddit", 0, "positive integer"),
+            ("title_filters", [], "title_filters"),
+            ("digest", [], "digest"),
+        ],
+    )
+    def test_invalid_optional_values_raise(
+        self, tmp_path, monkeypatch, field, value, message
+    ):
+        bad_dir = tmp_path / "monitors"
+        bad_dir.mkdir()
+        config = {
+            "name": "test",
+            "subreddits": ["python"],
+            "keywords": ["fastapi"],
+            field: value,
+        }
+        (bad_dir / "bad.json").write_text(json.dumps(config), encoding="utf-8")
+
+        import monitor_config
+        monkeypatch.setattr(monitor_config, "_CONFIG_DIR", bad_dir)
+        with pytest.raises(ValueError, match=message):
+            load_monitor("bad")
+
+    def test_invalid_title_regex_raises(self, tmp_path, monkeypatch):
+        bad_dir = tmp_path / "monitors"
+        bad_dir.mkdir()
+        (bad_dir / "bad.json").write_text(
+            json.dumps({
+                "name": "test",
+                "subreddits": ["python"],
+                "keywords": ["fastapi"],
+                "title_filters": {"python": "["},
+            }),
+            encoding="utf-8",
+        )
+        import monitor_config
+        monkeypatch.setattr(monitor_config, "_CONFIG_DIR", bad_dir)
+        with pytest.raises(ValueError, match="invalid title filter"):
+            load_monitor("bad")
+
+    def test_non_object_config_raises(self, tmp_path, monkeypatch):
+        bad_dir = tmp_path / "monitors"
+        bad_dir.mkdir()
+        (bad_dir / "bad.json").write_text("[]", encoding="utf-8")
+        import monitor_config
+        monkeypatch.setattr(monitor_config, "_CONFIG_DIR", bad_dir)
+        with pytest.raises(ValueError, match="JSON object"):
+            load_monitor("bad")
+
     def test_defaults_applied(self, tmp_path, monkeypatch):
         minimal_dir = tmp_path / "monitors"
         minimal_dir.mkdir()
@@ -127,6 +183,24 @@ class TestLoadMonitor:
     def test_config_values_not_overridden_by_defaults(self):
         config = load_monitor("churning")
         assert "churningcanada" in config["title_filters"]
+
+    def test_mutating_one_result_does_not_change_future_defaults(self, tmp_path, monkeypatch):
+        minimal_dir = tmp_path / "monitors"
+        minimal_dir.mkdir()
+        (minimal_dir / "minimal.json").write_text(
+            json.dumps({
+                "name": "test",
+                "subreddits": ["python"],
+                "keywords": ["fastapi"],
+            }),
+            encoding="utf-8",
+        )
+        import monitor_config
+        monkeypatch.setattr(monitor_config, "_CONFIG_DIR", minimal_dir)
+
+        first = load_monitor("minimal")
+        first["title_filters"]["python"] = "changed"
+        assert load_monitor("minimal")["title_filters"] == {}
 
 
 class TestListMonitorsEmptyDir:

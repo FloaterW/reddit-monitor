@@ -8,6 +8,7 @@ from reddit_scraper import (
     _parse_search_results,
     _parse_things,
     _strip_html,
+    fetch_subreddit_posts_rss,
 )
 
 
@@ -69,6 +70,23 @@ class TestParseComments:
         bodies = [c["body"] for c in results]
         assert any("Chase Sapphire" in b for b in bodies)
         assert any("Chase ink" in b for b in bodies)
+
+    def test_preserves_long_body_for_matching_and_storage(self):
+        long_body = "prefix " + ("x" * 1200) + " chase-at-the-end"
+        html = (
+            '<div class="sitetable" id="siteTable_t3_post">'
+            '<div data-type="comment" data-fullname="t1_long" data-author="alice">'
+            '<span class="score likes">1,234 points</span>'
+            '<time datetime="2026-08-01T12:00:00+00:00"></time>'
+            f'<div class="md"><p>{long_body}</p></div>'
+            '</div></div>'
+        )
+
+        result = _parse_comments(html, limit=10)[0]
+
+        assert result["body"] == long_body
+        assert result["score"] == 1234
+        assert result["body"].endswith("chase-at-the-end")
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +230,27 @@ class TestStripHtml:
 
     def test_collapses_whitespace(self):
         assert _strip_html("<p>  lots   of   space  </p>") == "lots of space"
+
+
+class TestRSSPostSelection:
+    def test_post_feed_honors_sort_time_and_limit(self, monkeypatch):
+        import reddit_scraper as rs
+
+        captured = {}
+
+        class EmptyRoot:
+            @staticmethod
+            def findall(*_args, **_kwargs):
+                return []
+
+        def fake_fetch(path, params):
+            captured.update(path=path, params=params)
+            return EmptyRoot()
+
+        monkeypatch.setattr(rs, "_fetch_rss", fake_fetch)
+
+        assert fetch_subreddit_posts_rss("python", limit=7, sort="top", time_filter="week") == {}
+        assert captured == {
+            "path": "/r/python/top/.rss",
+            "params": {"limit": 7, "t": "week"},
+        }

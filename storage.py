@@ -23,6 +23,11 @@ CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     monitor_name TEXT NOT NULL,
     started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL DEFAULT 'completed',
+    email_status TEXT,
+    quality_status TEXT,
+    error TEXT,
     time_filter TEXT NOT NULL,
     posts_per_subreddit INTEGER NOT NULL,
     raw_comment_count INTEGER NOT NULL,
@@ -62,7 +67,20 @@ CREATE TABLE IF NOT EXISTS digests (
     created_at TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_matches_run ON matches(run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_unique
+    ON matches(run_id, comment_id, keyword);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_digests_run ON digests(run_id);
 """
+
+_RUN_COLUMN_MIGRATIONS = {
+    "completed_at": "TEXT",
+    "status": "TEXT NOT NULL DEFAULT 'completed'",
+    "email_status": "TEXT",
+    "quality_status": "TEXT",
+    "error": "TEXT",
+}
 
 
 class DigestDB:
@@ -76,11 +94,22 @@ class DigestDB:
         self._create_tables()
 
     def _create_tables(self):
-        self.conn.executescript(_SCHEMA)
+        with self.conn:
+            self.conn.executescript(_SCHEMA)
+            existing = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(runs)")
+            }
+            for column, definition in _RUN_COLUMN_MIGRATIONS.items():
+                if column not in existing:
+                    self.conn.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column} {definition}"
+                    )
 
     def save_run(self, monitor_name, time_filter, posts_per_subreddit,
                  comments, digest_md=None, digest_path=None, raw_json_path=None,
-                 raw_comment_count=None):
+                 raw_comment_count=None, started_at=None, completed_at=None,
+                 status="completed", email_status=None, quality_status=None,
+                 error=None):
         """Save a complete run: metadata, comments, keyword matches, and digest.
 
         Args:
@@ -92,53 +121,70 @@ class DigestDB:
             digest_path: Path where the digest was saved.
             raw_json_path: Path where raw JSON was saved.
             raw_comment_count: Total comments before keyword filtering.
+            started_at: UTC datetime or ISO string captured before scraping began.
+            completed_at: UTC datetime or ISO string captured after processing ended.
+            status: Overall run outcome (for example, ``completed`` or ``failed``).
+            email_status: Delivery outcome, if email was requested.
+            quality_status: Digest evaluation outcome, if evaluation was enabled.
+            error: Sanitized failure detail for unsuccessful runs.
 
         Returns:
             The run ID.
         """
-        now = datetime.now(timezone.utc).isoformat()
+        def isoformat(value, default=None):
+            if value is None:
+                return default
+            return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+        now = datetime.now(timezone.utc)
+        started = isoformat(started_at, now.isoformat())
+        completed = isoformat(completed_at, now.isoformat())
         if raw_comment_count is None:
             raw_comment_count = len(comments)
 
-        cursor = self.conn.execute(
-            "INSERT INTO runs (monitor_name, started_at, time_filter, "
-            "posts_per_subreddit, raw_comment_count, matched_comment_count, "
-            "digest_path, raw_json_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (monitor_name, now, time_filter, posts_per_subreddit,
-             raw_comment_count, len(comments), digest_path, raw_json_path),
-        )
-        run_id = cursor.lastrowid
-
-        for idx, c in enumerate(comments):
-            comment_id = c.get("id", "")
-            if not comment_id:
-                comment_id = f"_no_id_{run_id}_{idx}"
-            self.conn.execute(
-                "INSERT OR IGNORE INTO comments "
-                "(id, run_id, subreddit, post_title, post_permalink, "
-                "author, score, created, depth, parent_id, body) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (comment_id, run_id, c.get("subreddit"),
-                 c.get("post_title"), c.get("post_permalink"),
-                 c.get("author"), c.get("score", 0), c.get("created"),
-                 c.get("depth", 0), c.get("parent_id"), c.get("body", "")),
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO runs (monitor_name, started_at, completed_at, status, "
+                "email_status, quality_status, error, time_filter, "
+                "posts_per_subreddit, raw_comment_count, matched_comment_count, "
+                "digest_path, raw_json_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    monitor_name, started, completed, status, email_status,
+                    quality_status, error, time_filter, posts_per_subreddit,
+                    raw_comment_count, len(comments), digest_path, raw_json_path,
+                ),
             )
+            run_id = cursor.lastrowid
 
-            for kw in c.get("matched_keywords", []):
+            for idx, c in enumerate(comments):
+                comment_id = c.get("id", "")
+                if not comment_id:
+                    comment_id = f"_no_id_{run_id}_{idx}"
                 self.conn.execute(
-                    "INSERT INTO matches (run_id, comment_id, keyword) "
-                    "VALUES (?, ?, ?)",
-                    (run_id, comment_id, kw),
+                    "INSERT OR IGNORE INTO comments "
+                    "(id, run_id, subreddit, post_title, post_permalink, "
+                    "author, score, created, depth, parent_id, body) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (comment_id, run_id, c.get("subreddit"),
+                     c.get("post_title"), c.get("post_permalink"),
+                     c.get("author"), c.get("score", 0), c.get("created"),
+                     c.get("depth", 0), c.get("parent_id"), c.get("body", "")),
                 )
 
-        if digest_md:
-            self.conn.execute(
-                "INSERT INTO digests (run_id, markdown, created_at) "
-                "VALUES (?, ?, ?)",
-                (run_id, digest_md, now),
-            )
+                for kw in c.get("matched_keywords", []):
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO matches (run_id, comment_id, keyword) "
+                        "VALUES (?, ?, ?)",
+                        (run_id, comment_id, kw),
+                    )
 
-        self.conn.commit()
+            if digest_md is not None:
+                self.conn.execute(
+                    "INSERT INTO digests (run_id, markdown, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (run_id, digest_md, completed),
+                )
         return run_id
 
     def get_runs(self, limit=10, monitor_name=None):

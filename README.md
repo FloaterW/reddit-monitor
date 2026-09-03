@@ -10,7 +10,7 @@ Point it at any set of subreddits and keywords and it handles scraping, deduplic
 2. **Filters** comments by keyword using regex word-boundary matching
 3. **Deduplicates** across multiple comment sort orders (top + new) per post
 4. **Summarizes** matched comments into a digest organized by topic, with links back to each original comment
-5. **Evaluates** digest quality — verifies citations, dollar amounts, numeric claims, and completeness against source data
+5. **Evaluates** every digest — verifies citation targets, line-level numeric claims, and completeness against source data
 6. **Emails** a styled HTML digest on a daily schedule
 7. **Stores** run history in SQLite for querying past digests and tracking trends
 8. **Saves** raw scraped data (JSON) and the final digest (Markdown)
@@ -65,31 +65,37 @@ A sample digest output is included in [`example_digest.md`](example_digest.md).
 
 **`reddit_scraper.py`** - Standalone scraper. Parses old.reddit.com HTML directly, no API key needed. Supports search, subreddit posts, single-post comments, and deep comment search. Handles rate limiting with retry and backoff.
 
-**`daily_digest.py`** - Orchestrator. Fetches comments across configured subreddits, filters by keyword, pipes matches through an LLM summarization step, converts the output to a styled HTML email, and sends it via Gmail SMTP. Supports monitor profiles and SQLite history.
+**`daily_digest.py`** - Orchestrator. Fetches comments, filters by keyword, summarizes in isolated batches, evaluates and sanitizes the result, writes outputs atomically, and then sends it via Gmail SMTP. It records the complete run, quality, and delivery outcome.
 
 **`monitor_config.py`** - Loads JSON monitor profiles from `config/monitors/`. Validates required fields, applies defaults, and supports the CLI > config > default priority chain.
 
 **`storage.py`** - SQLite storage for run history. Stores metadata, matched comments, keyword match counts, and generated digests with WAL mode for concurrent access.
 
-**`evaluate_digest.py`** - Standalone digest quality checker. Verifies citation coverage, dollar amounts, numeric claims, and completeness against source data.
+**`evaluate_digest.py`** - Standalone and integrated quality checker. It verifies citation coverage and integrity, global numeric consistency, line-level claim grounding, and high-signal comment coverage.
 
 **`run_digest.bat`** - Windows Task Scheduler wrapper. Runs the digest with timestamped output filenames and logs everything to `digest_run.log`. If the run exits non-zero, it calls `notify_failure.py` so the failure reaches your inbox instead of sitting silently in the log.
 
-**`notify_failure.py`** - Emails a failure alert with the tail of `digest_run.log`, the exit code, and recovery steps. Never changes the run's exit code, even if the alert itself cannot be sent.
+**`check_digest_ran.py`** - Independent watchdog. It validates the dated run-status record and the referenced nonempty digest, so a failed email or incomplete write cannot masquerade as success.
+
+**`notify_failure.py`** - Emails a failure alert with a bounded tail of `digest_run.log`, the exit code, and recovery steps. It reports its own delivery failure with a nonzero exit code.
 
 ## Prerequisites
 
 - **Python 3.10+**
-- **`requests`** and **`markdown`** libraries
+- Runtime dependencies from `requirements.txt`
 - **An LLM CLI tool** for summarization (see Summarization Engine below)
 
 ## Quick Start
 
 ```bash
-# Clone and install
+# Clone, create an isolated environment, and install
 git clone https://github.com/FloaterW/reddit-monitor.git
 cd reddit-monitor
-pip install -r requirements.txt
+python -m venv .venv
+
+# PowerShell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-lock.txt
 
 # Copy and edit .env (optional — see .env.example)
 cp .env.example .env
@@ -140,6 +146,12 @@ python daily_digest.py [OPTIONS]
   --keywords LIST    Override keywords (comma-separated)
   --db PATH          Save run history to a SQLite database
   --no-db            Skip database storage
+  --no-email         Disable email delivery for this run
+  --quality MODE     off | warn | strict (default: warn)
+  --evaluation-report FILE
+                      Override the JSON quality-report path
+  --status-file FILE Atomic status record used by the watchdog
+  --quiet-summary    Keep the full generated digest out of logs
   --history [N]      Show recent runs from the database (default: 10)
   --list-monitors    List available monitor profiles and exit
 ```
@@ -155,8 +167,10 @@ The digest uses an LLM to summarize scraped comments into a themed digest. It sh
 | `DIGEST_LLM_COMMAND` | `claude` | CLI executable for summarization |
 | `DIGEST_LLM_MODEL` | `claude-sonnet-4-6` | Model name passed via `--model` |
 | `DIGEST_LLM_TIMEOUT` | `1200` | Seconds to wait for summarization |
+| `DIGEST_LLM_MAX_INPUT_CHARS` | `80000` | Approximate source size per isolated batch |
+| `DIGEST_PROMPT_BODY_LIMIT` | `4000` | Per-comment prompt cap; stored source remains complete |
 
-Any CLI that accepts `-p --model <name>` with stdin/stdout works as a drop-in replacement. If the CLI is missing, the pipeline gives a clear error instead of a traceback.
+Any CLI that accepts `-p --model <name>` with stdin/stdout can be used. The child process runs in a temporary directory with a minimal environment. When the Claude CLI is selected, project/user settings and tools are explicitly disabled. Reddit text is untrusted input, and generated Markdown is stripped of raw HTML, images, and non-Reddit links before storage or email rendering.
 
 The prompt tells the summarizer to:
 - Organize by theme, not by subreddit or keyword
@@ -171,12 +185,12 @@ Edit `SUMMARY_PROMPT` in `daily_digest.py` to match your use case.
 The digest is emailed automatically after each run. To enable:
 
 1. **Generate a Gmail App Password** at https://myaccount.google.com/apppasswords
-2. **Save the password** to a file named `.gmail_app_password` in the project directory
-3. Set `DIGEST_EMAIL_TO` and `DIGEST_EMAIL_FROM` in your `.env` file (see `.env.example`)
+2. **Store it outside the repository and synced folders.** On Windows the default location is `%APPDATA%\reddit-digest\gmail_app_password`. You can instead set `DIGEST_GMAIL_PASSWORD_FILE` to another external path or inject `GMAIL_APP_PASSWORD` into the process environment.
+3. Set `DIGEST_EMAIL_TO` and `DIGEST_EMAIL_FROM` in `.env` (see `.env.example`). Do not place the password in `.env`.
 
-If `.gmail_app_password` doesn't exist or is empty, the email step is silently skipped and the digest is still saved to disk.
+If no password is configured, email is explicitly recorded as skipped and the digest is still saved. An attempted SMTP delivery that fails marks the whole run failed and returns a nonzero exit code.
 
-**Security:** The `.gmail_app_password` and `.env` files are excluded from version control via `.gitignore`.
+Project-local credential files and `GMAIL_APP_PASSWORD` entries in `.env` are deliberately ignored. This prevents an ignored file in a cloned or synced working tree from becoming the active secret source.
 
 ## Email Rendering
 
@@ -206,7 +220,7 @@ The database uses WAL mode for safe concurrent reads (e.g., querying history whi
 
 ## Digest Quality Evaluation
 
-`evaluate_digest.py` checks a generated digest against its source comments to catch LLM hallucinations and omissions:
+Quality evaluation runs automatically after summarization. `warn` mode records failures and still delivers the digest; `strict` mode blocks email and exits nonzero. `off` disables evaluation. The standalone command remains available:
 
 ```bash
 # Evaluate a digest
@@ -221,8 +235,10 @@ python evaluate_digest.py digest.md raw.json --json
 | Check | What it catches |
 |-------|-----------------|
 | Citation coverage | Authors whose comments were used but not attributed |
+| Citation integrity | Links that do not resolve to the cited author's source comment |
 | Dollar amounts | Dollar figures in the digest not found in source comments |
 | Numeric claims | Percentages, multipliers, and point/mile amounts the LLM invented |
+| Claim grounding | Numeric claims not present in a source cited on the same line |
 | Completeness | High-scoring comments that the digest ignored entirely |
 
 ## Automated Daily Scheduling (Windows)
@@ -254,7 +270,7 @@ Register-ScheduledTask `
 Start-ScheduledTask -TaskName "RedditDailyDigest"
 ```
 
-Logs are written to `digest_run.log` in the project directory.
+The batch wrapper prefers `.venv`, rotates `digest_run.log` at 5 MiB, keeps full digest text out of the log, and writes `data/last_run_status.json`. Schedule `run_watchdog.bat` separately after the expected completion time; it alerts if the run did not finish successfully, the email failed, or the digest is missing/empty.
 
 ## Standalone Scraper Usage
 
@@ -279,13 +295,14 @@ python reddit_scraper.py deep-search "FastAPI" --subreddit python,webdev --posts
 
 ## How the Scraper Works
 
-The scraper parses old.reddit.com HTML directly. No API key, OAuth, or PRAW needed.
+The scraper first tries old.reddit.com HTML and falls back to Reddit's RSS feeds when login is required. No API key, OAuth, or PRAW is needed.
 
 - **Post parsing** - extracts `data-*` attributes from `<div>` elements with `data-type="link"` (score, author, timestamp, permalink)
-- **Comment parsing** - two-pass: first pass uses `html.parser.HTMLParser` to walk the DOM and track depth via `<div>` nesting; second pass uses regex to pull body text, score, and timestamps
+- **Comment parsing** - a structured `HTMLParser` walk extracts complete bodies, score, timestamps, nesting depth, and parent IDs
 - **Rate limiting** - 1s between comment fetches, 1.5s between posts, 2s between subreddits, plus retry with backoff on HTTP 429
 - **Deduplication** - uses comment ID as the primary key, falling back to a composite hash of author + body + timestamp + post permalink when IDs are missing
-- **Graceful degradation** - network errors and 4xx/5xx responses return `None` instead of crashing, so one failed request doesn't kill the run
+- **RSS fallback** - honors post count, sort, time window, and title filters before selecting comments
+- **Graceful degradation** - retries transient failures and falls back from HTML to RSS; a run with no usable matches is recorded as failed rather than silently succeeding
 
 ## Output Files
 
@@ -293,22 +310,27 @@ Each run produces:
 
 - **`digest_YYYYMMDD_HHMM.md`** - the digest in Markdown
 - **`digest_YYYYMMDD_HHMM.json`** - raw scraped comments with metadata (when `--save-raw` is used)
-- **`digest_run.log`** - append-only log of all scheduled runs (stdout + stderr)
+- **`digest_YYYYMMDD_HHMM.evaluation.json`** - deterministic quality results
+- **`data/last_run_status.json`** - atomic machine-readable run, quality, and email outcome
+- **`digest_run.log`** - scheduled-run output, rotated to `digest_run.previous.log` at 5 MiB
 
 ## Testing
 
 ```bash
 # Install dev dependencies
-pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev-lock.txt
 
 # Run tests
 python -m pytest -q
+
+# Coverage gate used by CI
+python -m pytest --cov=. --cov-fail-under=60
 
 # Lint
 python -m ruff check .
 ```
 
-115 tests covering HTML parsing, keyword matching, dedup logic, time-window filtering, markdown email preprocessing, config loading/validation, SQLite storage, and digest quality evaluation. All tests use static fixtures with no network calls.
+Tests cover parsing, matching, RSS selection, retries, LLM isolation, email outcomes, atomic run lifecycle, watchdog behavior, configuration, transactional SQLite storage, and digest evaluation. Tests use static fixtures and mocks rather than live network calls. CI runs on Linux and Windows with Python 3.10 and 3.12, audits dependencies, and enforces the coverage floor. CodeQL scans the default branch and pull requests.
 
 ## Project Structure
 
@@ -324,20 +346,26 @@ reddit-digest/
 │   └── job-market.json         # CS job market monitor
 ├── run_digest.bat              # Windows Task Scheduler wrapper
 ├── notify_failure.py           # Emails an alert when a scheduled run fails
+├── check_digest_ran.py         # Independent successful-run watchdog
+├── run_watchdog.bat            # Windows wrapper for the watchdog
 ├── requirements.txt            # Python dependencies
 ├── requirements-dev.txt        # Dev dependencies (pytest, ruff)
+├── requirements-lock.txt       # Reproducible resolved runtime versions
+├── requirements-dev-lock.txt   # Reproducible resolved CI/dev versions
 ├── pyproject.toml              # Project config (pytest, ruff settings)
 ├── example_digest.md           # Sample digest output
 ├── .env.example                # Environment variable template
-├── .github/workflows/ci.yml    # GitHub Actions CI (lint + test)
+├── .github/workflows/          # Cross-platform CI and CodeQL scanning
+├── .github/dependabot.yml      # Automated dependency update configuration
+├── LICENSE                     # MIT license
 ├── .gitignore                  # Excludes credentials, outputs, caches
-├── tests/                      # pytest test suite (115 tests)
+├── tests/                      # Offline pytest regression suite
 └── README.md                   # This file
 ```
 
 ## Design Tradeoffs / Limitations
 
-**Why HTML scraping instead of the Reddit API?** The project parses `old.reddit.com` HTML directly with regex and `html.parser` to avoid OAuth credentials and API key management. The tradeoff is **markup fragility**: if Reddit changes their HTML, the parsers need updating. A future version could switch to PRAW or the official API.
+**Why HTML/RSS scraping instead of the Reddit API?** The project parses old.reddit.com HTML and uses RSS as a fallback to avoid OAuth credentials and API key management. The tradeoff is **markup/feed fragility and reduced RSS metadata**: Reddit changes may require parser updates, and RSS comments commonly report a score of zero. A future version could switch to PRAW or the official API.
 
 **Rate limiting.** The scraper adds 1-2 second delays between requests and handles HTTP 429 with backoff. Heavy usage (many subreddits, high `--posts` counts) may still trigger Reddit's rate limiter, which slows the run but doesn't crash it.
 
