@@ -323,15 +323,27 @@ class TestLLMSecurityBoundary:
             "# Digest\n"
             "![beacon](https://evil.example/track)\n"
             "[bad](https://evil.example/phish)\n"
+            "[reference][outside]\n"
+            "[outside]: https://evil.example/reference\n"
+            "<https://evil.example/autolink>\n"
+            "bare https://evil.example/plain\n"
             "[good](https://reddit.com/r/test/comments/abc/post/def/)\n"
+            "[reddit reference][source]\n"
+            "[source]: https://reddit.com/r/test/comments/abc/post/ghi/\n"
             "<script>alert(1)</script>"
         )
         cleaned = sanitize_digest_markdown(unsafe)
 
         assert "![" not in cleaned
         assert "evil.example" not in cleaned
+        assert "[reference][outside]" in cleaned
+        assert "[external link removed]" in cleaned
         assert (
             "[good](https://reddit.com/r/test/comments/abc/post/def/)"
+            in cleaned.splitlines()
+        )
+        assert (
+            "[source]: https://reddit.com/r/test/comments/abc/post/ghi/"
             in cleaned.splitlines()
         )
         assert "<script>" not in cleaned

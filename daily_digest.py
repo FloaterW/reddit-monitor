@@ -529,6 +529,11 @@ def _is_reddit_url(value):
 
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 _MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
+_MARKDOWN_AUTOLINK_RE = re.compile(r"<(https?://[^<>\s]+)>", re.IGNORECASE)
+_MARKDOWN_REFERENCE_DEF_RE = re.compile(
+    r"(?m)^[ \t]{0,3}\[([^\]\r\n]+)\]:[ \t]*(?:<([^>\r\n]+)>|(\S+))[^\r\n]*$"
+)
+_BARE_HTTP_URL_RE = re.compile(r"https?://[^\s<>\[\]{}\"']+", re.IGNORECASE)
 _RAW_HTML_RE = re.compile(r"</?[A-Za-z][^>]*>")
 
 
@@ -541,7 +546,31 @@ def sanitize_digest_markdown(md_text):
         return match.group(0) if _is_reddit_url(destination) else label
 
     md_text = _MARKDOWN_LINK_RE.sub(clean_link, md_text)
-    return _RAW_HTML_RE.sub("", md_text)
+
+    def clean_reference(match):
+        destination = (match.group(2) or match.group(3) or "").strip()
+        return match.group(0) if _is_reddit_url(destination) else ""
+
+    md_text = _MARKDOWN_REFERENCE_DEF_RE.sub(clean_reference, md_text)
+
+    def clean_autolink(match):
+        destination = match.group(1).strip()
+        if _is_reddit_url(destination):
+            return f"[{destination}]({destination})"
+        return "[external link removed]"
+
+    md_text = _MARKDOWN_AUTOLINK_RE.sub(clean_autolink, md_text)
+    md_text = _RAW_HTML_RE.sub("", md_text)
+
+    def clean_bare_url(match):
+        candidate = match.group(0)
+        destination = candidate.rstrip(".,;:!?")
+        suffix = candidate[len(destination):]
+        if _is_reddit_url(destination):
+            return candidate
+        return f"[external link removed]{suffix}"
+
+    return _BARE_HTTP_URL_RE.sub(clean_bare_url, md_text)
 
 
 def _llm_environment():
