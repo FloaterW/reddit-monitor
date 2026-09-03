@@ -12,7 +12,7 @@ from check_digest_ran import (
 from check_digest_ran import (
     main as watchdog_main,
 )
-from daily_digest import atomic_write_text, main
+from daily_digest import _load_gmail_password, atomic_write_text, main, send_email
 from storage import DigestDB
 
 
@@ -132,6 +132,59 @@ class TestDigestRunLifecycle:
         status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
         assert status["status"] == "failed"
         assert "list of comment objects" in status["error"]
+
+
+class TestEmailDelivery:
+    def test_project_local_password_file_is_rejected(self, tmp_path, monkeypatch):
+        import daily_digest
+
+        project = tmp_path / "project"
+        project.mkdir()
+        local_password = project / "password"
+        local_password.write_text("do-not-load", encoding="utf-8")
+        monkeypatch.setattr(daily_digest, "__file__", str(project / "daily_digest.py"))
+        monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
+        monkeypatch.setenv("DIGEST_GMAIL_PASSWORD_FILE", str(local_password))
+
+        assert _load_gmail_password() == ("", None)
+
+    def test_external_password_file_is_loaded(self, tmp_path, monkeypatch):
+        import daily_digest
+
+        project = tmp_path / "project"
+        project.mkdir()
+        external_password = tmp_path / "credentials" / "password"
+        external_password.parent.mkdir()
+        external_password.write_text("external-secret", encoding="utf-8")
+        monkeypatch.setattr(daily_digest, "__file__", str(project / "daily_digest.py"))
+        monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
+        monkeypatch.setenv("DIGEST_GMAIL_PASSWORD_FILE", str(external_password))
+
+        assert _load_gmail_password() == ("external-secret", "configured file")
+
+    def test_missing_password_returns_skipped(self):
+        with patch("daily_digest.GMAIL_APP_PASSWORD", ""):
+            assert send_email("Digest", "# Body", ["test"]) == "skipped"
+
+    def test_smtp_success_returns_sent(self):
+        with (
+            patch("daily_digest.GMAIL_APP_PASSWORD", "secret"),
+            patch("daily_digest.GMAIL_PASSWORD_SOURCE", "environment"),
+            patch("smtplib.SMTP_SSL") as smtp,
+        ):
+            result = send_email("Digest", "# Body", ["test"])
+
+        assert result == "sent"
+        smtp.return_value.__enter__.return_value.login.assert_called_once()
+        smtp.return_value.__enter__.return_value.sendmail.assert_called_once()
+
+    def test_smtp_failure_returns_failed(self):
+        with (
+            patch("daily_digest.GMAIL_APP_PASSWORD", "secret"),
+            patch("daily_digest.GMAIL_PASSWORD_SOURCE", "environment"),
+            patch("smtplib.SMTP_SSL", side_effect=OSError("offline")),
+        ):
+            assert send_email("Digest", "# Body", ["test"]) == "failed"
 
 
 class TestWatchdogStatus:

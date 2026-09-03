@@ -37,7 +37,14 @@ if _env_file.exists():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
-            os.environ.setdefault(_k.strip(), _v.strip())
+            _key = _k.strip()
+            if _key == "GMAIL_APP_PASSWORD":
+                print(
+                    "[WARN] Ignoring GMAIL_APP_PASSWORD in .env; inject it through "
+                    "the process environment or an external credential file."
+                )
+                continue
+            os.environ.setdefault(_key, _v.strip())
 
 # ---------------------------------------------------------------------------
 # Config — edit these to match your interests
@@ -107,9 +114,15 @@ def _load_gmail_password():
             (Path(app_data) / "reddit-digest" / "gmail_app_password", "external file")
         )
 
-    # Compatibility only. New setups must keep credentials outside this synced repo.
-    candidates.append((Path(__file__).parent / ".gmail_app_password", "legacy project file"))
     for path, source in candidates:
+        try:
+            if path.resolve().is_relative_to(Path(__file__).parent.resolve()):
+                print(
+                    f"[WARN] Ignoring Gmail password file inside the project: {path}"
+                )
+                continue
+        except OSError:
+            pass
         try:
             password = path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
@@ -828,12 +841,6 @@ def send_email(subject, body_md, subreddits=None):
     if not GMAIL_APP_PASSWORD:
         print("[SKIP] No Gmail app password configured — email not sent.")
         return "skipped"
-    if GMAIL_PASSWORD_SOURCE == "legacy project file":
-        print(
-            "[WARN] Gmail password is in the project folder. Move it to the "
-            "configured external credential file."
-        )
-
     import smtplib
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
