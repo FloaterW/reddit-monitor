@@ -10,6 +10,7 @@ Usage:
 
 import smtplib
 import sys
+from collections import deque
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -24,7 +25,7 @@ def read_log_tail(log_path, lines=LOG_TAIL_LINES):
     """Return the last `lines` lines of the log, or a placeholder."""
     try:
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            return "".join(f.readlines()[-lines:]).strip()
+            return "".join(deque(f, maxlen=lines)).strip()
     except OSError as e:
         return f"(could not read {log_path}: {e})"
 
@@ -41,7 +42,7 @@ def main():
 
     if not GMAIL_APP_PASSWORD:
         print("[SKIP] No Gmail app password configured — alert not sent.")
-        return 0
+        return 1
 
     stamp = datetime.now().strftime("%B %d, %Y at %H:%M")
     body = (
@@ -69,9 +70,8 @@ def main():
         print(f"[OK] Failure alert emailed to {EMAIL_TO}")
         return 0
     except Exception as e:
-        # Never let the notifier itself change the run's outcome.
         print(f"[ERROR] Failure alert could not be sent: {e}")
-        return 0
+        return 1
 
 
 if __name__ == "__main__":

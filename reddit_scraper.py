@@ -906,7 +906,8 @@ def main():
         if args.command == "search":
             print("Tip: try --sort relevance, widen --time (e.g. all), or simplify the query.")
 
-    save_to_json(payload, output)
+    if not save_to_json(payload, output):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

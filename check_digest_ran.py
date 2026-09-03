@@ -18,13 +18,21 @@ Usage:
   python check_digest_ran.py --due 19:30  # override the due time
 """
 
+import argparse
+import json
+import re
 import smtplib
 import sys
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
 
-from daily_digest import EMAIL_FROM, EMAIL_TO, GMAIL_APP_PASSWORD
+from daily_digest import (
+    DEFAULT_STATUS_FILE,
+    EMAIL_FROM,
+    EMAIL_TO,
+    GMAIL_APP_PASSWORD,
+)
 from notify_failure import read_log_tail
 
 PROJECT_DIR = Path(__file__).parent
@@ -37,34 +45,79 @@ DEFAULT_DUE = "19:30"
 
 def parse_due(value):
     """Parse a HH:MM due time. Falls back to DEFAULT_DUE if malformed."""
-    try:
-        hour, _, minute = value.partition(":")
-        return int(hour), int(minute)
-    except ValueError:
-        print(f"[WARN] Could not parse due time {value!r}; "
-              f"using {DEFAULT_DUE}.")
-        hour, _, minute = DEFAULT_DUE.partition(":")
-        return int(hour), int(minute)
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value or "")
+    if match:
+        hour, minute = (int(part) for part in match.groups())
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    print(f"[WARN] Could not parse due time {value!r}; using {DEFAULT_DUE}.")
+    hour, minute = (int(part) for part in DEFAULT_DUE.split(":"))
+    return hour, minute
 
 
 def find_todays_digests(day=None):
     """Return today's digest markdown files, newest first."""
     day = day or datetime.now()
     pattern = f"digest_{day:%Y%m%d}_*.md"
-    return sorted(PROJECT_DIR.glob(pattern), key=lambda p: p.stat().st_mtime,
-                  reverse=True)
+    candidates = []
+    for path in PROJECT_DIR.glob(pattern):
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                if path.read_text(encoding="utf-8", errors="replace").strip():
+                    candidates.append(path)
+        except OSError:
+            continue
+    return sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
-def send_alert(day):
+def check_run_status(status_path, day):
+    """Return (state, message): state is success, failed, or missing."""
+    path = Path(status_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "missing", f"status file not found: {path}"
+    except (json.JSONDecodeError, OSError) as exc:
+        return "failed", f"status file is unreadable: {exc}"
+
+    expected_date = day.date().isoformat()
+    if payload.get("date") != expected_date:
+        return "missing", f"latest status is for {payload.get('date') or 'an unknown date'}"
+
+    status = payload.get("status")
+    if status not in {"completed", "completed_with_warnings"}:
+        detail = payload.get("error") or f"run status is {status or 'missing'}"
+        return "failed", detail
+
+    digest_value = payload.get("digest_path")
+    if not digest_value:
+        return "failed", "successful status does not name a digest file"
+    digest_path = Path(digest_value)
+    if not digest_path.is_absolute():
+        digest_path = PROJECT_DIR / digest_path
+    try:
+        if not digest_path.is_file() or not digest_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).strip():
+            return "failed", f"digest is missing or empty: {digest_path}"
+    except OSError as exc:
+        return "failed", f"digest cannot be read: {exc}"
+
+    email_status = payload.get("email_status")
+    if email_status == "failed":
+        return "failed", "digest email delivery failed"
+    return "success", f"completed digest: {digest_path.name}"
+
+
+def send_alert(day, reason="no successful run status was found"):
     """Email a 'digest never ran' alert. Returns True if sent."""
     if not GMAIL_APP_PASSWORD:
         print("[SKIP] No Gmail app password configured — alert not sent.")
         return False
 
     body = (
-        f"No digest was produced for {day:%B %d, %Y}.\n\n"
-        f"The scheduled run appears not to have completed. Because nothing\n"
-        f"ran, run_digest.bat could not report the failure itself.\n\n"
+        f"No successful digest run was recorded for {day:%B %d, %Y}.\n\n"
+        f"Reason: {reason}\n\n"
         f"Things worth checking:\n"
         f"  - Was the machine awake at the scheduled run time?\n"
         f"    The task uses S4U logon, so it runs whether you are signed\n"
@@ -93,38 +146,42 @@ def send_alert(day):
         return False
 
 
-def main():
-    quiet = "--quiet" in sys.argv
-    now = datetime.now()
+def main(argv=None, now=None):
+    parser = argparse.ArgumentParser(description="Check that today's digest succeeded")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--due", default=DEFAULT_DUE, help="Due time in HH:MM")
+    parser.add_argument("--status-file", default=str(DEFAULT_STATUS_FILE))
+    args = parser.parse_args(argv)
+    now = now or datetime.now()
+    due_hour, due_minute = parse_due(args.due)
 
-    due = DEFAULT_DUE
-    if "--due" in sys.argv:
-        idx = sys.argv.index("--due")
-        if idx + 1 < len(sys.argv):
-            due = sys.argv[idx + 1]
-        else:
-            print("ERROR: --due requires a HH:MM value")
-            return 1
-    due_hour, due_minute = parse_due(due)
-
-    found = find_todays_digests(now)
-    if found:
-        if not quiet:
-            print(f"[OK] Digest present for {now:%Y-%m-%d}: {found[0].name}")
+    state, reason = check_run_status(args.status_file, now)
+    if state == "success":
+        if not args.quiet:
+            print(f"[OK] Digest succeeded for {now:%Y-%m-%d}: {reason}")
         return 0
+
+    # Compatibility for installations upgrading from filename-only checks.
+    if state == "missing":
+        found = find_todays_digests(now)
+        if found:
+            if not args.quiet:
+                print(
+                    f"[OK] Legacy digest present for {now:%Y-%m-%d}: "
+                    f"{found[0].name} (no current status file)"
+                )
+            return 0
 
     # Nothing yet — but say nothing until the digest is actually overdue,
     # otherwise a morning run would report a failure that has not happened.
     if (now.hour, now.minute) < (due_hour, due_minute):
-        if not quiet:
+        if not args.quiet:
             print(f"[OK] No digest yet for {now:%Y-%m-%d}, but it is not due "
                   f"until {due_hour:02d}:{due_minute:02d} — no alert.")
         return 0
 
-    print(f"[ALERT] No digest found for {now:%Y-%m-%d} — sending alert.")
-    send_alert(now)
-    # Always exit 0: the watchdog reports problems, it is not one itself.
-    return 0
+    print(f"[ALERT] Digest run failed for {now:%Y-%m-%d}: {reason}")
+    return 0 if send_alert(now, reason) else 1
 
 
 if __name__ == "__main__":

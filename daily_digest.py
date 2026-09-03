@@ -63,7 +63,6 @@ KEYWORDS = [
 ]
 
 POSTS_PER_SUB = 10
-MAX_RESULTS_PER_KEYWORD = 30
 POST_SORT = "new"
 TIME_FILTER = "day"
 
@@ -88,14 +87,101 @@ except ValueError:
     PROMPT_BODY_LIMIT = 4_000
 
 # Email — leave GMAIL_APP_PASSWORD empty to skip emailing.
-# Generate an app password at https://myaccount.google.com/apppasswords
 EMAIL_TO = os.getenv("DIGEST_EMAIL_TO", "your_email@gmail.com")
 EMAIL_FROM = os.getenv("DIGEST_EMAIL_FROM", "your_email@gmail.com")
-GMAIL_APP_PASSWORD = ""
 
-_pw_file = Path(__file__).parent / ".gmail_app_password"
-if _pw_file.exists():
-    GMAIL_APP_PASSWORD = _pw_file.read_text().strip()
+
+def _load_gmail_password():
+    """Load the SMTP secret from the environment or a file outside the project."""
+    environment_password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    if environment_password:
+        return environment_password, "environment"
+
+    configured_path = os.getenv("DIGEST_GMAIL_PASSWORD_FILE")
+    app_data = os.getenv("APPDATA")
+    candidates = []
+    if configured_path:
+        candidates.append((Path(configured_path).expanduser(), "configured file"))
+    elif app_data:
+        candidates.append(
+            (Path(app_data) / "reddit-digest" / "gmail_app_password", "external file")
+        )
+
+    # Compatibility only. New setups must keep credentials outside this synced repo.
+    candidates.append((Path(__file__).parent / ".gmail_app_password", "legacy project file"))
+    for path, source in candidates:
+        try:
+            password = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print(f"[WARN] Could not read Gmail password file {path}: {exc}")
+            continue
+        if password:
+            return password, source
+    return "", None
+
+
+GMAIL_APP_PASSWORD, GMAIL_PASSWORD_SOURCE = _load_gmail_password()
+
+PROJECT_DIR = Path(__file__).parent
+DEFAULT_STATUS_FILE = PROJECT_DIR / "data" / "last_run_status.json"
+
+
+def atomic_write_text(path, text):
+    """Atomically replace a UTF-8 text file, leaving no partial destination."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temp_path = Path(temporary.name)
+        os.replace(temp_path, destination)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def atomic_write_json(path, payload):
+    """Serialize JSON and atomically replace its destination."""
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def write_run_status(path, *, started_at, status, exit_code, monitor_name,
+                     digest_path=None, raw_json_path=None, email_status=None,
+                     quality_status=None, evaluation_path=None, error=None):
+    """Publish the final run outcome consumed by the watchdog."""
+    completed_at = datetime.now(timezone.utc)
+    payload = {
+        "version": 1,
+        "date": datetime.now().astimezone().date().isoformat(),
+        "started_at": started_at.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "status": status,
+        "exit_code": exit_code,
+        "monitor": monitor_name,
+        "digest_path": str(Path(digest_path).resolve()) if digest_path else None,
+        "raw_json_path": str(Path(raw_json_path).resolve()) if raw_json_path else None,
+        "email_status": email_status,
+        "quality_status": quality_status,
+        "evaluation_path": (
+            str(Path(evaluation_path).resolve()) if evaluation_path else None
+        ),
+        "error": error,
+    }
+    atomic_write_json(path, payload)
+    return completed_at
 
 
 # ---------------------------------------------------------------------------
@@ -738,10 +824,15 @@ def _markdown_to_safe_html(md_text):
 
 
 def send_email(subject, body_md, subreddits=None):
-    """Send the digest as an HTML email via Gmail SMTP."""
+    """Send the digest as HTML email and return sent, skipped, or failed."""
     if not GMAIL_APP_PASSWORD:
         print("[SKIP] No Gmail app password configured — email not sent.")
-        return False
+        return "skipped"
+    if GMAIL_PASSWORD_SOURCE == "legacy project file":
+        print(
+            "[WARN] Gmail password is in the project folder. Move it to the "
+            "configured external credential file."
+        )
 
     import smtplib
     from email.mime.multipart import MIMEMultipart
@@ -764,16 +855,81 @@ def send_email(subject, body_md, subreddits=None):
             server.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
         print(f"[OK] Digest emailed to {EMAIL_TO}")
-        return True
+        return "sent"
     except Exception as e:
         print(f"[ERROR] Email failed: {e}")
-        return False
+        return "failed"
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
+def _positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _csv_values(value, label):
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values:
+        raise ValueError(f"--{label} must contain at least one non-empty value")
+    return values
+
+
+def _load_comments_json(path):
+    source = Path(path)
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"--from-json file not found: {source}") from exc
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"could not read {source}: {exc}") from exc
+
+    comments = raw.get("results") if isinstance(raw, dict) else raw
+    if not isinstance(comments, list) or not all(
+        isinstance(comment, dict) for comment in comments
+    ):
+        raise ValueError(
+            "--from-json must contain a list of comment objects or a results list"
+        )
+    return comments
+
+
+def _save_run_history(*, db_path, monitor_name, time_filter, posts,
+                      comments, summary, digest_path, raw_json_path,
+                      raw_comment_count, started_at, status, email_status,
+                      quality_status, error):
+    from storage import DigestDB
+
+    db = DigestDB(db_path)
+    try:
+        run_id = db.save_run(
+            monitor_name=monitor_name,
+            time_filter=time_filter,
+            posts_per_subreddit=posts,
+            comments=comments,
+            digest_md=summary,
+            digest_path=digest_path,
+            raw_json_path=raw_json_path,
+            raw_comment_count=raw_comment_count,
+            started_at=started_at,
+            completed_at=datetime.now(timezone.utc),
+            status=status,
+            email_status=email_status,
+            quality_status=quality_status,
+            error=error,
+        )
+    finally:
+        db.close()
+    print(f"[OK] Run #{run_id} saved to database: {db_path}")
+
+
+def main(argv=None):
     from monitor_config import list_monitors, load_monitor
 
     parser = argparse.ArgumentParser(
@@ -781,7 +937,7 @@ def main():
     )
     parser.add_argument("--monitor", type=str, default=None,
                         help="Load a monitor profile from config/monitors/ (e.g. churning)")
-    parser.add_argument("--posts", type=int, default=None,
+    parser.add_argument("--posts", type=_positive_int, default=None,
                         help=f"Posts to scan per subreddit (default: {POSTS_PER_SUB})")
     parser.add_argument("--time", type=str, default=None,
                         choices=["hour", "day", "week", "month", "year", "all"],
@@ -802,11 +958,24 @@ def main():
                         help="Save run history to a SQLite database (e.g. data/reddit_monitor.db)")
     parser.add_argument("--no-db", action="store_true",
                         help="Skip database storage even if --db was previously used")
+    parser.add_argument("--no-email", action="store_true",
+                        help="Do not attempt email delivery")
+    parser.add_argument("--quality", choices=["off", "warn", "strict"],
+                        default=os.getenv("DIGEST_QUALITY_MODE", "warn"),
+                        help="Quality gate: off, warn, or strict (default: warn)")
+    parser.add_argument("--evaluation-report", type=str, default=None,
+                        help="Path for the JSON quality report")
+    parser.add_argument("--status-file", type=str,
+                        default=os.getenv("DIGEST_STATUS_FILE", str(DEFAULT_STATUS_FILE)),
+                        help="Atomic run-status file used by the watchdog")
+    parser.add_argument("--quiet-summary", action="store_true",
+                        help="Do not print the full generated digest to the log")
     parser.add_argument("--list-monitors", action="store_true",
                         help="List available monitor profiles and exit")
-    parser.add_argument("--history", type=int, nargs="?", const=10, default=None,
+    parser.add_argument("--history", type=_positive_int, nargs="?", const=10,
+                        default=None,
                         help="Show recent runs from the database and exit (default: 10)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.list_monitors:
         monitors = list_monitors()
@@ -816,12 +985,12 @@ def main():
                 print(f"  {m}")
         else:
             print("No monitor profiles found in config/monitors/")
-        return
+        return 0
 
     if args.history is not None:
         if not args.db:
             print("ERROR: --history requires --db <path>")
-            sys.exit(1)
+            return 1
         from storage import DigestDB
         monitor_filter = None
         if args.monitor:
@@ -832,88 +1001,173 @@ def main():
         db.close()
         if not runs:
             print("No runs recorded yet.")
-            return
-        print(f"{'ID':>4}  {'Monitor':<25} {'Date':<22} {'Matched':>7}  {'Time'}")
-        print("-" * 75)
+            return 0
+        print(
+            f"{'ID':>4}  {'Monitor':<25} {'Date':<22} {'Matched':>7}  "
+            f"{'Status':<23} {'Email'}"
+        )
+        print("-" * 105)
         for r in runs:
             started = r["started_at"][:19].replace("T", " ")
             print(f"{r['id']:>4}  {r['monitor_name']:<25} {started:<22} "
-                  f"{r['matched_comment_count']:>7}  {r['time_filter']}")
-        return
+                  f"{r['matched_comment_count']:>7}  "
+                  f"{r.get('status', 'completed'):<23} "
+                  f"{r.get('email_status') or '-'}")
+        return 0
 
-    # Resolve settings: CLI args > monitor config > code defaults
+    started_at = datetime.now(timezone.utc)
     monitor = None
-    if args.monitor:
+    monitor_name = args.monitor or "default"
+    comments = []
+    summary = None
+    stats = {"raw_comment_count": 0, "matched_comment_count": 0}
+    tf = args.time_filter or TIME_FILTER
+    posts = args.posts or POSTS_PER_SUB
+    digest_path = args.save
+    raw_json_path = args.save_raw or args.from_json
+    evaluation_path = args.evaluation_report
+    email_status = "disabled" if args.no_email else None
+    quality_status = "disabled" if args.quality == "off" else None
+    status_path = Path(args.status_file)
+
+    def finalize(status, exit_code, error=None):
+        nonlocal status_path
+        final_status = status
+        final_exit_code = exit_code
+        final_error = error
+        if args.db and not args.no_db:
+            try:
+                _save_run_history(
+                    db_path=args.db,
+                    monitor_name=monitor_name,
+                    time_filter=tf,
+                    posts=posts,
+                    comments=comments,
+                    summary=summary,
+                    digest_path=digest_path,
+                    raw_json_path=raw_json_path,
+                    raw_comment_count=stats.get("raw_comment_count", len(comments)),
+                    started_at=started_at,
+                    status=final_status,
+                    email_status=email_status,
+                    quality_status=quality_status,
+                    error=final_error,
+                )
+            except Exception as exc:
+                print(f"[ERROR] Could not save run history: {exc}")
+                final_status = "failed"
+                final_exit_code = final_exit_code or 1
+                final_error = final_error or "Database history save failed"
         try:
-            monitor = load_monitor(args.monitor)
-        except ValueError as e:
-            print(f"ERROR: {e}")
-            sys.exit(1)
+            write_run_status(
+                status_path,
+                started_at=started_at,
+                status=final_status,
+                exit_code=final_exit_code,
+                monitor_name=monitor_name,
+                digest_path=digest_path,
+                raw_json_path=raw_json_path,
+                email_status=email_status,
+                quality_status=quality_status,
+                evaluation_path=evaluation_path,
+                error=final_error,
+            )
+            print(f"[OK] Run status saved to: {status_path}")
+        except OSError as exc:
+            print(f"[ERROR] Could not save run status: {exc}")
+            return final_exit_code or 1
+        return final_exit_code
 
-    if args.subreddits:
-        subs = [s.strip() for s in args.subreddits.split(",")]
-    elif monitor:
-        subs = monitor["subreddits"]
-    else:
-        subs = SUBREDDITS
-
-    if args.keywords:
-        kws = [k.strip() for k in args.keywords.split(",")]
-    elif monitor:
-        kws = monitor["keywords"]
-    else:
-        kws = KEYWORDS
-
-    posts = args.posts if args.posts is not None else (monitor["posts_per_subreddit"] if monitor else POSTS_PER_SUB)
-    tf = args.time_filter if args.time_filter is not None else (monitor["time_filter"] if monitor else TIME_FILTER)
-    post_sort = monitor["post_sort"] if monitor else POST_SORT
-    title_filters = monitor.get("title_filters", {}) if monitor else POST_TITLE_FILTERS
-    digest_meta = monitor.get("digest", {}) if monitor else {}
-    digest_title = digest_meta.get("title", "Churning Digest")
-
-    print("=" * 60)
-    print(f"  DAILY REDDIT DIGEST — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    if monitor:
-        print(f"  Monitor: {monitor['name']}")
-    print(f"  Subreddits: {', '.join('r/' + s for s in subs)}")
-    print(f"  Keywords: {', '.join(kws)}")
-    print(f"  Time window: {tf}")
-    print("=" * 60)
-
-    if args.from_json:
-        raw_path = Path(args.from_json)
-        if not raw_path.exists():
-            print(f"ERROR: --from-json file not found: {raw_path}")
-            sys.exit(1)
-        try:
-            with open(raw_path, encoding="utf-8") as f:
-                comments = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"ERROR: could not read {raw_path}: {e}")
-            sys.exit(1)
-        print(f"\n[OK] Loaded {len(comments)} comments from {raw_path} "
-              f"(skipping scrape)")
-    else:
-        comments = scrape_all(kws, subs, posts, tf,
-                              post_sort=post_sort, title_filters=title_filters)
-
-    if not comments:
-        print("\nNo comments found. Nothing to summarize.")
-        return
-
-    verb = "Loaded" if args.from_json else "Scraped"
-    print(f"\n{'=' * 60}")
-    print(f"  {verb} {len(comments)} unique comments. Summarizing...")
-    print(f"{'=' * 60}")
-
-    if args.save_raw:
-        with open(args.save_raw, "w", encoding="utf-8") as f:
-            json.dump(comments, f, indent=2, ensure_ascii=False)
-        print(f"[OK] Raw comments saved to: {args.save_raw}")
-
-    time_label = {"hour": "hour", "day": "24 hours", "week": "week",
-                  "month": "month", "year": "year", "all": "all time"}
     try:
+        # Resolve settings: CLI args > monitor config > code defaults
+        if args.monitor:
+            monitor = load_monitor(args.monitor)
+            monitor_name = monitor["name"]
+
+        if args.subreddits:
+            subs = _csv_values(args.subreddits, "subreddits")
+        elif monitor:
+            subs = monitor["subreddits"]
+        else:
+            subs = SUBREDDITS
+
+        if args.keywords:
+            kws = _csv_values(args.keywords, "keywords")
+        elif monitor:
+            kws = monitor["keywords"]
+        else:
+            kws = KEYWORDS
+
+        posts = args.posts if args.posts is not None else (
+            monitor["posts_per_subreddit"] if monitor else POSTS_PER_SUB
+        )
+        tf = args.time_filter if args.time_filter is not None else (
+            monitor["time_filter"] if monitor else TIME_FILTER
+        )
+        post_sort = monitor["post_sort"] if monitor else POST_SORT
+        title_filters = monitor.get("title_filters", {}) if monitor else POST_TITLE_FILTERS
+        digest_meta = monitor.get("digest", {}) if monitor else {}
+        digest_title = digest_meta.get("title", "Churning Digest")
+
+        if not digest_path:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M")
+            digest_path = f"digest_{stamp}.md"
+        if args.quality != "off" and not evaluation_path:
+            evaluation_path = str(Path(digest_path).with_suffix(".evaluation.json"))
+
+        write_run_status(
+            status_path,
+            started_at=started_at,
+            status="running",
+            exit_code=None,
+            monitor_name=monitor_name,
+            digest_path=digest_path,
+            raw_json_path=raw_json_path,
+            email_status=email_status,
+            quality_status=quality_status,
+            evaluation_path=evaluation_path,
+        )
+
+        print("=" * 60)
+        print(f"  DAILY REDDIT DIGEST — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        if monitor:
+            print(f"  Monitor: {monitor_name}")
+        print(f"  Subreddits: {', '.join('r/' + sub for sub in subs)}")
+        print(f"  Keywords: {', '.join(kws)}")
+        print(f"  Time window: {tf}")
+        print("=" * 60)
+
+        if args.from_json:
+            comments = _load_comments_json(args.from_json)
+            stats["raw_comment_count"] = len(comments)
+            stats["matched_comment_count"] = len(comments)
+            print(f"\n[OK] Loaded {len(comments)} comments from {args.from_json} "
+                  f"(skipping scrape)")
+        else:
+            comments = scrape_all(
+                kws,
+                subs,
+                posts,
+                tf,
+                post_sort=post_sort,
+                title_filters=title_filters,
+                stats=stats,
+            )
+
+        if not comments:
+            raise RuntimeError("No matching comments found; no digest was produced")
+
+        verb = "Loaded" if args.from_json else "Scraped"
+        print(f"\n{'=' * 60}")
+        print(f"  {verb} {len(comments)} unique comments. Summarizing...")
+        print(f"{'=' * 60}")
+
+        if args.save_raw:
+            atomic_write_json(args.save_raw, comments)
+            print(f"[OK] Raw comments saved to: {args.save_raw}")
+
+        time_label = {"hour": "hour", "day": "24 hours", "week": "week",
+                      "month": "month", "year": "year", "all": "all time"}
         summary = summarize(
             comments,
             time_label.get(tf, "24 hours"),
@@ -922,45 +1176,51 @@ def main():
             description=monitor.get("description") if monitor else None,
             subreddits=subs,
         )
-    except RuntimeError as e:
-        print(f"\nERROR: {e}")
-        print("Raw data was saved — rerun with a longer timeout or fewer posts.")
-        sys.exit(1)
+        if not args.quiet_summary:
+            print("\n" + summary)
 
-    print("\n" + summary)
+        atomic_write_text(digest_path, summary)
+        print(f"\n[OK] Summary saved to: {digest_path}")
 
-    if args.save:
-        digest_path = args.save
-    else:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        digest_path = f"digest_{stamp}.md"
+        if args.quality != "off":
+            from evaluate_digest import evaluate, evaluation_passed, format_report
 
-    with open(digest_path, "w", encoding="utf-8") as f:
-        f.write(summary)
-    print(f"\n[OK] Summary saved to: {digest_path}")
-
-    date_str = datetime.now().strftime("%B %d, %Y")
-    send_email(f"{digest_title} — {date_str}", summary, subreddits=subs)
-
-    # Save to database if requested
-    if args.db and not args.no_db:
-        from storage import DigestDB
-        db = DigestDB(args.db)
-        try:
-            monitor_name = monitor["name"] if monitor else "default"
-            run_id = db.save_run(
-                monitor_name=monitor_name,
-                time_filter=tf,
-                posts_per_subreddit=posts,
-                comments=comments,
-                digest_md=summary,
-                digest_path=digest_path,
-                raw_json_path=args.save_raw,
+            quality_results = evaluate(summary, comments)
+            quality_ok = evaluation_passed(quality_results)
+            quality_status = "passed" if quality_ok else "failed"
+            atomic_write_json(
+                evaluation_path,
+                {"passed": quality_ok, "checks": quality_results},
             )
-            print(f"[OK] Run #{run_id} saved to database: {args.db}")
-        finally:
-            db.close()
+            print("\n" + format_report(quality_results))
+            print(f"[OK] Quality report saved to: {evaluation_path}")
+            if not quality_ok and args.quality == "strict":
+                email_status = "blocked_by_quality_gate"
+                print("[ERROR] Strict quality gate failed; email was not sent.")
+                return finalize("failed", 3, "Strict digest quality gate failed")
+
+        if args.no_email:
+            print("[SKIP] Email disabled by --no-email.")
+        else:
+            date_str = datetime.now().strftime("%B %d, %Y")
+            email_status = send_email(
+                f"{digest_title} — {date_str}", summary, subreddits=subs
+            )
+            if email_status == "failed":
+                return finalize("failed", 4, "Digest email delivery failed")
+
+        status = (
+            "completed_with_warnings"
+            if quality_status == "failed"
+            else "completed"
+        )
+        return finalize(status, 0)
+    except Exception as exc:
+        print(f"\nERROR: {exc}")
+        if args.save_raw and comments:
+            print(f"Raw data is available at {args.save_raw}.")
+        return finalize("failed", 1, str(exc)[:500])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
