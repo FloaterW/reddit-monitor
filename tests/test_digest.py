@@ -8,6 +8,7 @@ from daily_digest import (
     _build_llm_command,
     _chunk_comments,
     _comment_in_window,
+    _fetch_all_comments_rss,
     _markdown_to_safe_html,
     _preprocess_md,
     _wrap_html_email,
@@ -70,6 +71,59 @@ class TestTimeAll:
             result = scrape_all(["chase"], ["test"], 1, "day")
 
         assert len(result) == 0
+
+    def test_scrape_all_reports_raw_and_matched_counts(self):
+        fake_comments = [
+            {"id": "t1_match", "body": "chase offer", "created": ""},
+            {"id": "t1_other", "body": "unrelated", "created": ""},
+        ]
+        stats = {}
+        with patch("daily_digest._fetch_all_comments", return_value=fake_comments):
+            result = scrape_all(["chase"], ["test"], 1, "all", stats=stats)
+
+        assert len(result) == 1
+        assert stats == {"raw_comment_count": 2, "matched_comment_count": 1}
+
+
+class TestRSSFallback:
+    def test_filters_comments_to_selected_posts(self):
+        comments = [
+            {"id": "t1_a", "_post_id": "a", "post_title": "slug a"},
+            {"id": "t1_c", "_post_id": "c", "post_title": "slug c"},
+        ]
+        with (
+            patch("daily_digest.fetch_subreddit_posts_rss", return_value={"a": "Keep me"}) as posts,
+            patch("daily_digest.fetch_subreddit_comments_rss", return_value=comments),
+            patch("daily_digest.time.sleep"),
+        ):
+            result = _fetch_all_comments_rss(
+                ["test"], posts_per_sub=7, post_sort="top", time_filter="week",
+                title_filters={},
+            )
+
+        posts.assert_called_once_with("test", limit=7, sort="top", time_filter="week")
+        assert [comment["id"] for comment in result] == ["t1_a"]
+        assert result[0]["post_title"] == "Keep me"
+        assert "_post_id" not in result[0]
+
+    def test_applies_title_filter_before_comment_selection(self):
+        comments = [
+            {"id": "t1_a", "_post_id": "a", "post_title": "slug a"},
+            {"id": "t1_b", "_post_id": "b", "post_title": "slug b"},
+        ]
+        with (
+            patch(
+                "daily_digest.fetch_subreddit_posts_rss",
+                return_value={"a": "Daily thread", "b": "Keep weekly thread"},
+            ),
+            patch("daily_digest.fetch_subreddit_comments_rss", return_value=comments),
+            patch("daily_digest.time.sleep"),
+        ):
+            result = _fetch_all_comments_rss(
+                ["test"], 10, "new", "day", {"test": "weekly"},
+            )
+
+        assert [comment["id"] for comment in result] == ["t1_b"]
 
 
 # ---------------------------------------------------------------------------

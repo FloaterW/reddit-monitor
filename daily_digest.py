@@ -108,34 +108,48 @@ from reddit_scraper import (
 )
 
 
-def _fetch_all_comments_rss(subreddits, title_filters):
+def _fetch_all_comments_rss(subreddits, posts_per_sub, post_sort, time_filter,
+                            title_filters):
     """Fetch comments via RSS when old.reddit.com is inaccessible."""
     all_comments = []
 
     for sub in subreddits:
         print(f"\n  Fetching r/{sub} comments via RSS...")
 
-        post_titles = fetch_subreddit_posts_rss(sub)
+        post_titles = fetch_subreddit_posts_rss(
+            sub,
+            limit=posts_per_sub,
+            sort=post_sort,
+            time_filter=time_filter,
+        )
         time.sleep(5)
 
         comments = fetch_subreddit_comments_rss(sub)
 
-        for c in comments:
-            pid = c.pop("_post_id", "")
-            if pid and pid in post_titles:
-                c["post_title"] = post_titles[pid]
-
         title_pat = title_filters.get(sub)
         if title_pat:
-            before = len(comments)
-            comments = [
-                c for c in comments
-                if re.search(title_pat, c.get("post_title", ""), re.IGNORECASE)
-            ]
-            print(f"    Fetched {len(comments)} comments "
-                  f"(title-filtered from {before})")
+            post_titles = {
+                post_id: title
+                for post_id, title in post_titles.items()
+                if re.search(title_pat, title, re.IGNORECASE)
+            }
+
+        allowed_post_ids = set(post_titles)
+        comments = [
+            comment for comment in comments
+            if comment.get("_post_id", "") in allowed_post_ids
+        ]
+
+        for c in comments:
+            pid = c.pop("_post_id", "")
+            c["post_title"] = post_titles[pid]
+
+        if title_pat:
+            print(f"    Fetched {len(comments)} comments from "
+                  f"{len(post_titles)} title-filtered posts")
         else:
-            print(f"    Fetched {len(comments)} comments")
+            print(f"    Fetched {len(comments)} comments from "
+                  f"{len(post_titles)} selected posts")
 
         all_comments.extend(comments)
 
@@ -153,7 +167,13 @@ def _fetch_all_comments(subreddits, posts_per_sub, post_sort, time_filter,
 
     if not old_reddit_available():
         print("\n  old.reddit.com requires login — using RSS feeds.")
-        return _fetch_all_comments_rss(subreddits, title_filters)
+        return _fetch_all_comments_rss(
+            subreddits,
+            posts_per_sub,
+            post_sort,
+            time_filter,
+            title_filters,
+        )
 
     all_comments = []
 
@@ -224,12 +244,14 @@ def _comment_in_window(created_str, cutoff_dt):
 
 
 def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
-               post_sort=None, title_filters=None):
+               post_sort=None, title_filters=None, stats=None):
     """Fetch all comments once, then filter for any matching keyword."""
     raw = _fetch_all_comments(subreddits, posts_per_sub,
                               post_sort or POST_SORT, time_filter,
                               title_filters=title_filters)
     print(f"\n  Total comments fetched: {len(raw)}")
+    if stats is not None:
+        stats["raw_comment_count"] = len(raw)
 
     if time_filter == "all":
         recent = raw
@@ -254,6 +276,8 @@ def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
                 matched.append(c)
 
     print(f"  Comments matching keywords: {len(matched)}")
+    if stats is not None:
+        stats["matched_comment_count"] = len(matched)
 
     kw_counts = {}
     for c in matched:

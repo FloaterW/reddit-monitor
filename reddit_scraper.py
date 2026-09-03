@@ -242,88 +242,108 @@ def _parse_search_results(html, limit):
 
 
 def _parse_comments(html, limit):
-    """Parse comment things from old.reddit comment page with depth tracking.
-
-    Uses html.parser to properly track <div> nesting so comment depth and
-    parent_id are derived from the actual DOM tree structure, not heuristics.
-    """
+    """Parse complete comment bodies with DOM-based depth and parent tracking."""
     from html.parser import HTMLParser
 
-    # Pass 1: walk the DOM to find comment IDs, depths, and parents.
-    class _DepthWalker(HTMLParser):
+    class _CommentWalker(HTMLParser):
         def __init__(self):
-            super().__init__()
+            super().__init__(convert_charrefs=True)
             self.div_stack = []
+            self.span_stack = []
             self.comment_depth = 0
             self.parent_stack = []
+            self.comment_stack = []
+            self.body_stack = []
+            self.score_stack = []
             self.results = []
 
         def handle_starttag(self, tag, attrs):
+            attr_map = dict(attrs)
+            if tag == "time" and self.comment_stack:
+                current = self.comment_stack[-1]
+                if current is not None:
+                    current["created"] = _parse_iso_time(attr_map.get("datetime", ""))
+                return
+
+            if tag == "span":
+                classes = set(attr_map.get("class", "").split())
+                target = self.comment_stack[-1] if self.comment_stack and "score" in classes else None
+                self.span_stack.append(target)
+                if target is not None:
+                    self.score_stack.append(target)
+                return
+
+            if tag in {"br", "p", "li"} and self.body_stack:
+                self.body_stack[-1]["_body_parts"].append("\n")
+
             if tag != "div":
                 return
-            a = dict(attrs)
-            cls = a.get("class", "")
+
+            classes = set(attr_map.get("class", "").split())
             div_role = None
 
-            if "sitetable" in cls and a.get("id", "").startswith("siteTable_t1_"):
+            if "sitetable" in classes and attr_map.get("id", "").startswith("siteTable_t1_"):
                 div_role = "sitetable"
-                parent_id = "t1_" + a["id"][len("siteTable_t1_"):]
+                parent_id = "t1_" + attr_map["id"][len("siteTable_t1_"):]
                 self.comment_depth += 1
                 self.parent_stack.append(parent_id)
-            elif a.get("data-type") == "comment":
+            elif attr_map.get("data-type") == "comment":
                 div_role = "comment"
-                self.results.append({
-                    "id": a.get("data-fullname", ""),
-                    "author": a.get("data-author", ""),
-                    "depth": self.comment_depth,
-                    "parent_id": self.parent_stack[-1] if self.parent_stack else "",
-                    "pos": self.getpos(),
-                })
+                current = None
+                if len(self.results) < limit:
+                    current = {
+                        "id": attr_map.get("data-fullname", ""),
+                        "author": _author_name(attr_map.get("data-author", "")),
+                        "score": 0,
+                        "body": "",
+                        "created": "",
+                        "depth": self.comment_depth,
+                        "parent_id": self.parent_stack[-1] if self.parent_stack else "",
+                        "_body_parts": [],
+                    }
+                    self.results.append(current)
+                self.comment_stack.append(current)
+            elif "md" in classes and self.comment_stack:
+                current = self.comment_stack[-1]
+                if current is not None:
+                    div_role = "body"
+                    self.body_stack.append(current)
 
             self.div_stack.append(div_role)
 
         def handle_endtag(self, tag):
+            if tag == "span" and self.span_stack:
+                target = self.span_stack.pop()
+                if target is not None and self.score_stack:
+                    self.score_stack.pop()
+                return
             if tag != "div" or not self.div_stack:
                 return
             role = self.div_stack.pop()
-            if role == "sitetable":
+            if role == "body" and self.body_stack:
+                self.body_stack.pop()
+            elif role == "comment" and self.comment_stack:
+                self.comment_stack.pop()
+            elif role == "sitetable":
                 self.comment_depth -= 1
                 if self.parent_stack:
                     self.parent_stack.pop()
 
-    walker = _DepthWalker()
+        def handle_data(self, data):
+            if self.body_stack:
+                self.body_stack[-1]["_body_parts"].append(data)
+            if self.score_stack:
+                score_match = re.search(r"(-?[\d,]+)\s*point", data, re.IGNORECASE)
+                if score_match:
+                    self.score_stack[-1]["score"] = int(score_match.group(1).replace(",", ""))
+
+    walker = _CommentWalker()
     walker.feed(html)
-    tree_info = {r["id"]: r for r in walker.results}
-
-    # Pass 2: extract body / score / time via regex (faster than parsing).
-    results = []
-    for m in re.finditer(r'<div[^>]*data-type="comment"[^>]*>', html):
-        if len(results) >= limit:
-            break
-
-        tag = m.group()
-        fullname_m = re.search(r'data-fullname="([^"]*)"', tag)
-        comment_id = fullname_m.group(1) if fullname_m else ""
-        info = tree_info.get(comment_id, {})
-
-        author_m = re.search(r'data-author="([^"]*)"', tag)
-        chunk = html[m.end() : m.end() + 2000]
-        score_m = re.search(r'class="[^"]*score[^"]*"[^>]*>(\d+)\s*point', chunk)
-        time_m = re.search(r'<time[^>]*datetime="([^"]+)"', chunk)
-        body_m = re.search(r'<div class="md">(.*?)</div>', chunk, re.DOTALL)
-
-        entry = {
-            "id": comment_id,
-            "author": _author_name(author_m.group(1) if author_m else None),
-            "score": int(score_m.group(1)) if score_m else 0,
-            "body": _truncate(_strip_html(body_m.group(1)) if body_m else "", 500),
-            "created": _parse_iso_time(time_m.group(1) if time_m else ""),
-            "depth": info.get("depth", 0),
-            "parent_id": info.get("parent_id", ""),
-        }
-        results.append(entry)
-
-    return results
+    for result in walker.results:
+        result["body"] = re.sub(
+            r"\s+", " ", "".join(result.pop("_body_parts", []))
+        ).strip()
+    return walker.results
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +639,7 @@ def _rss_entry_to_comment(entry):
     updated = entry.findtext("atom:updated", "", _RSS_NS)
     entry_id = entry.findtext("atom:id", "", _RSS_NS)
     content_html = entry.findtext("atom:content", "", _RSS_NS)
-    body = _truncate(_strip_html(content_html), 500) if content_html else ""
+    body = _strip_html(content_html) if content_html else ""
 
     parts = permalink.rstrip("/").split("/")
     subreddit = post_id = post_slug = ""
@@ -685,13 +705,16 @@ def fetch_subreddit_comments_rss(subreddit, max_pages=3, per_page=100):
     return all_comments
 
 
-def fetch_subreddit_posts_rss(subreddit, limit=25):
+def fetch_subreddit_posts_rss(subreddit, limit=25, sort="new", time_filter="day"):
     """Fetch post titles from a subreddit via RSS.
 
     Returns a dict mapping post_id -> title for enriching comment data.
     """
     params = {"limit": limit}
-    root = _fetch_rss(f"/r/{subreddit}/.rss", params)
+    if sort == "top":
+        params["t"] = time_filter
+    suffix = "" if sort == "hot" else f"/{sort}"
+    root = _fetch_rss(f"/r/{subreddit}{suffix}/.rss", params)
     if root is None:
         return {}
 
