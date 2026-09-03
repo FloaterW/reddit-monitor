@@ -2,7 +2,7 @@
 .env
 .gmail_app_password
 
-# Private planning docs — local only, never publish
+# Local planning docs
 COMMUNITY_INTELLIGENCE_ROADMAP.md
 
 # Scraper output
@@ -24,6 +24,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 dist/
+.venv/
 
 # Test / coverage
 .pytest_cache/
