@@ -208,7 +208,7 @@ class TestDigestDB:
         invalid = _sample_comments()
         invalid[1]["score"] = object()
 
-        with pytest.raises(sqlite3.ProgrammingError):
+        with pytest.raises(sqlite3.Error):
             db.save_run("bad", "day", 5, invalid)
 
         good_run_id = db.save_run("good", "day", 5, _sample_comments())

@@ -1,5 +1,6 @@
 """Tests for daily_digest.py — time filtering, dedup, markdown preprocessing, summarizer errors."""
 
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -329,7 +330,10 @@ class TestLLMSecurityBoundary:
 
         assert "![" not in cleaned
         assert "evil.example" not in cleaned
-        assert "https://reddit.com/" in cleaned
+        assert (
+            "[good](https://reddit.com/r/test/comments/abc/post/def/)"
+            in cleaned.splitlines()
+        )
         assert "<script>" not in cleaned
 
     def test_email_html_allowlist_blocks_active_content(self):
@@ -342,7 +346,9 @@ class TestLLMSecurityBoundary:
         assert "<img" not in rendered
         assert "<form" not in rendered
         assert "evil.example" not in rendered
-        assert "https://reddit.com/" in rendered
+        assert re.findall(r'href="([^"]+)"', rendered) == [
+            "https://reddit.com/r/test/comments/a/b/c/"
+        ]
 
     def test_chunking_never_drops_comments(self):
         comments = [
