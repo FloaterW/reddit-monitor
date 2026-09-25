@@ -60,6 +60,8 @@ jobs:
           --cov=check_digest_ran
           --cov=notify_failure
           --cov=verified_digest
+          --cov=editorial_profiles
+          --cov=demo_digest
           --cov-report=term
           --cov-fail-under=60
 

@@ -11,6 +11,8 @@ import json
 import re
 from pathlib import Path
 
+from editorial_profiles import validate_editorial_config
+
 _CONFIG_DIR = Path(__file__).parent / "config" / "monitors"
 
 _REQUIRED_FIELDS = {"name", "subreddits", "keywords"}
@@ -115,14 +117,14 @@ def load_monitor(name):
             ) from exc
 
     digest = config["digest"]
-    if not isinstance(digest, dict) or any(
-        key not in {"title", "audience"}
-        or not isinstance(value, str)
-        or not value.strip()
-        for key, value in digest.items()
-    ):
+    if not isinstance(digest, dict) or set(digest) - {"title", "audience", "editorial"}:
+        raise ValueError(f"Monitor '{name}': invalid 'digest' settings")
+    if any(not isinstance(digest[key], str) or not digest[key].strip()
+           for key in ("title", "audience") if key in digest):
         raise ValueError(
             f"Monitor '{name}': 'digest' must contain non-empty title/audience strings"
         )
+    if "editorial" in digest:
+        validate_editorial_config(digest["editorial"])
 
     return copy.deepcopy(config)

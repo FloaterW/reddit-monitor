@@ -49,6 +49,10 @@
   },
   "digest": {
     "title": "Churning Digest",
-    "audience": "credit card churning and award travel enthusiasts"
+    "audience": "credit card churning and award travel enthusiasts",
+    "editorial": {
+      "preset": "churning",
+      "financial_checks": true
+    }
   }
 }

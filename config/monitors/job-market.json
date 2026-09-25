@@ -16,6 +16,12 @@
   "title_filters": {},
   "digest": {
     "title": "Job Market Digest",
-    "audience": "software engineers and CS students tracking the job market"
+    "audience": "software engineers and CS students tracking the job market",
+    "editorial": {
+      "preset": "general",
+      "priorities": "Hiring and recruiting changes, interview processes, compensation, remote-work policies, and first-hand career experiences. Distinguish individual experiences from verified employer policies; do not infer industry-wide trends from isolated reports.",
+      "style": "Use descriptive headings about hiring, interviews, compensation, or workplace policy. Keep employer, role, location and seniority context when supplied. Label anecdotes and unresolved questions. Do not force empty categories or a minimum length.",
+      "financial_checks": false
+    }
   }
 }

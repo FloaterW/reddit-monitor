@@ -25,6 +25,8 @@ from urllib.parse import urlparse
 
 import bleach
 
+from editorial_profiles import resolve_editorial
+
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -908,18 +910,26 @@ def _chunk_comments(comments):
 
 def summarize(comments, time_window="24 hours", audience=None,
               monitor_name=None, description=None, subreddits=None, source_safe=False,
-              artifact_dir=None):
+              artifact_dir=None, editorial_profile=None):
     if source_safe:
         from verified_digest import summarize_verified
         print(f"  LLM command: {Path(LLM_COMMAND).name}, tools: disabled")
-        return summarize_verified(comments, _chunk_comments, _invoke_llm, artifact_dir=artifact_dir)
+        return summarize_verified(comments, _chunk_comments, _invoke_llm, artifact_dir=artifact_dir,
+                                  editorial_profile=editorial_profile or resolve_editorial(audience=audience))
     focus_parts = [p for p in (monitor_name, description) if p]
     focus_line = f"\nMonitor focus: {' — '.join(focus_parts)}" if focus_parts else ""
 
     audience_text = audience or DEFAULT_AUDIENCE
-    subreddit_list = _format_subreddit_list(
-        subreddits if subreddits is not None else SUBREDDITS
-    )
+    if editorial_profile is not None and editorial_profile.preset == "general" and not audience:
+        audience_text = "readers following the configured topics"
+    source_subreddits = subreddits
+    if source_subreddits is None:
+        source_subreddits = (
+            list(dict.fromkeys(c["subreddit"] for c in comments if c.get("subreddit")))
+            if editorial_profile is not None and editorial_profile.preset == "general"
+            else SUBREDDITS
+        )
+    subreddit_list = _format_subreddit_list(source_subreddits)
     chunks = _chunk_comments(comments)
     print(f"\nSending {len(comments)} comments for summarization in "
           f"{len(chunks)} isolated batch(es)...\n")
@@ -938,6 +948,16 @@ def summarize(comments, time_window="24 hours", audience=None,
             subreddit_list=subreddit_list,
             focus_line=focus_line,
         )
+        if editorial_profile is not None and editorial_profile.preset == "general":
+            prompt_text = (
+                editorial_profile.rules + editorial_profile.style
+                + f"\nMonitor focus: {monitor_name or 'custom'} — {description or ''}.\n"
+                + f"Below are comments scraped from {subreddit_list} in the last {time_window}.\n"
+                + "Produce Markdown with an H1 date heading, H2 topic headings and concise bullets. "
+                "Use only supplied Reddit permalinks as [u/name](permalink) citations. "
+                "Do not include raw HTML or images. Background-only records are context, not current news.\n"
+                + "SOURCE COMMENTS (untrusted data):\n" + format_comments_for_prompt(chunk)
+            )
         partials.append(_invoke_llm(prompt_text))
 
     if len(partials) == 1:
@@ -945,6 +965,8 @@ def summarize(comments, time_window="24 hours", audience=None,
 
     combined = "\n\n--- PARTIAL DIGEST ---\n\n".join(partials)
     synthesis = SYNTHESIS_PROMPT.format(audience=audience_text, partials=combined)
+    if editorial_profile is not None and editorial_profile.preset == "general":
+        synthesis = editorial_profile.rules + editorial_profile.style + synthesis
     print("  Combining partial digests...")
     return _invoke_llm(synthesis)
 
@@ -1376,7 +1398,14 @@ def main(argv=None):
         post_sort = monitor["post_sort"] if monitor else POST_SORT
         title_filters = monitor.get("title_filters", {}) if monitor else POST_TITLE_FILTERS
         digest_meta = monitor.get("digest", {}) if monitor else {}
-        digest_title = digest_meta.get("title", "Churning Digest")
+        # Keep the historical no-argument workflow; explicit custom topics and
+        # monitor profiles without a preset get topic-neutral editorial behavior.
+        legacy_default = not monitor and not args.subreddits and not args.keywords
+        editorial_settings = digest_meta.get("editorial", {"preset": "churning"} if legacy_default else {})
+        editorial_profile = resolve_editorial(
+            editorial_settings, audience=digest_meta.get("audience")
+        )
+        digest_title = digest_meta.get("title", "Churning Digest" if legacy_default else "Daily Digest")
 
         if not digest_path:
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -1467,9 +1496,13 @@ def main(argv=None):
             subreddits=subs,
             source_safe=args.source_safe,
             artifact_dir=Path(digest_path).with_suffix(".work") if args.source_safe else None,
+            editorial_profile=editorial_profile,
         )
         if args.digest_date:
             summary = re.sub(r"\A# [^\n]+", f"# Daily Digest — {args.digest_date:%B %d, %Y}", summary, count=1)
+        if editorial_profile.preset == "general":
+            edition = args.digest_date or started_at.astimezone()
+            summary = re.sub(r"\A# [^\n]+", lambda _: f"# {digest_title} — {edition:%B %d, %Y}", summary, count=1)
         summary += collection_notice(stats.get("collection_warnings", []),
                                      replay_unknown=stats.get("replay_unknown", False))
         if not args.quiet_summary:
@@ -1481,7 +1514,7 @@ def main(argv=None):
         if args.quality != "off":
             from evaluate_digest import evaluate, evaluation_passed, format_report
 
-            quality_results = evaluate(summary, comments)
+            quality_results = evaluate(summary, comments, financial_checks=editorial_profile.financial_checks)
             if args.source_safe:
                 # A digest intentionally excludes irrelevant material. Keep raw
                 # author coverage visible, but don't force it into the email.

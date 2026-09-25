@@ -369,7 +369,7 @@ def check_editorial_quality(digest_text, comments):
 # ---------------------------------------------------------------------------
 # Full evaluation
 # ---------------------------------------------------------------------------
-def evaluate(digest_text, comments):
+def evaluate(digest_text, comments, *, financial_checks=True):
     """Run all checks and return a combined report dict."""
     return {
         "citation_coverage": check_citation_coverage(digest_text, comments),
@@ -378,7 +378,10 @@ def evaluate(digest_text, comments):
         "numeric_claims": check_numeric_claims(digest_text, comments),
         "claim_grounding": check_claim_grounding(digest_text, comments),
         "completeness": check_completeness(digest_text, comments),
-        "arithmetic_consistency": check_arithmetic_consistency(digest_text),
+        "arithmetic_consistency": check_arithmetic_consistency(digest_text) if financial_checks else {
+            "passed": True, "issues": [], "required": False,
+            "note": "Domain-specific financial arithmetic checks are disabled for this profile.",
+        },
         "editorial_quality": check_editorial_quality(digest_text, comments),
     }
 
@@ -450,7 +453,8 @@ def format_report(results):
             lines.append(f"  ... and {len(comp['missing']) - 5} more")
 
     arithmetic = results.get("arithmetic_consistency", {"passed": True, "issues": []})
-    lines.append(f"Arithmetic consistency [{'PASS' if arithmetic['passed'] else 'FAIL'}]: "
+    arithmetic_status = "SKIP" if not arithmetic.get("required", True) else ("PASS" if arithmetic['passed'] else "FAIL")
+    lines.append(f"Arithmetic consistency [{arithmetic_status}]: "
                  f"{len(arithmetic['issues'])} explicit relationship issues (not a full fact check)")
     for issue in arithmetic["issues"][:5]:
         lines.append(f"  - line {issue['line']}: {issue['issue']}")
@@ -478,6 +482,7 @@ def main():
     parser.add_argument("comments", type=str, help="Path to raw comments JSON file")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--verbose", action="store_true", help="Show detailed results")
+    parser.add_argument("--monitor", help="Apply this monitor's optional financial checks")
     args = parser.parse_args()
 
     digest_path = Path(args.digest)
@@ -501,7 +506,13 @@ def main():
         print("ERROR: Comments JSON must be a list or have a 'results' key")
         sys.exit(1)
 
-    results = evaluate(digest_text, comments)
+    financial_checks = True
+    if args.monitor:
+        from editorial_profiles import resolve_editorial
+        from monitor_config import load_monitor
+        metadata = load_monitor(args.monitor).get("digest", {})
+        financial_checks = resolve_editorial(metadata.get("editorial"), audience=metadata.get("audience")).financial_checks
+    results = evaluate(digest_text, comments, financial_checks=financial_checks)
 
     if args.json:
         print(json.dumps(results, indent=2))
