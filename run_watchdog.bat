@@ -24,7 +24,7 @@ exit /b 1
 :python_found
 
 echo [%date% %time%] Watchdog check... >> digest_run.log
-%PYTHON_CMD% check_digest_ran.py --status-file data/last_run_status.json >> digest_run.log 2>&1
+%PYTHON_CMD% check_digest_ran.py --status-file data/last_run_status.json --wait-running >> digest_run.log 2>&1
 set EXITCODE=%ERRORLEVEL%
 echo. >> digest_run.log
 exit /b %EXITCODE%

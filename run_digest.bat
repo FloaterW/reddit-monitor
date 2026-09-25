@@ -23,6 +23,12 @@ exit /b 1
 
 :python_found
 
+rem Explicit, expiring one-shot diagnostic; never sends email or writes the live DB.
+if exist "data\codex-migration\test-request.json" (
+    %PYTHON_CMD% -u scheduled_digest_test.py >> "data\codex-migration\background.log" 2>&1
+    if not errorlevel 75 exit /b
+)
+
 for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmm"') do set STAMP=%%I
 
 if exist digest_run.log (
@@ -33,7 +39,7 @@ if exist digest_run.log (
 )
 
 echo [%date% %time%] Starting digest run... >> digest_run.log
-%PYTHON_CMD% daily_digest.py --monitor churning --save "digest_%STAMP%.md" --save-raw "digest_%STAMP%.json" --db data/monitor.db --status-file data/last_run_status.json --quality warn --quiet-summary >> digest_run.log 2>&1
+%PYTHON_CMD% daily_digest.py --monitor churning --source-safe --save "digest_%STAMP%.md" --save-raw "digest_%STAMP%.json" --db data/monitor.db --status-file data/last_run_status.json --quality strict --quiet-summary >> digest_run.log 2>&1
 set EXITCODE=%ERRORLEVEL%
 echo [%date% %time%] Finished with exit code %EXITCODE% >> digest_run.log
 

@@ -37,6 +37,99 @@ python daily_digest.py --subreddits technology,programming --keywords "layoff,ac
 
 A sample digest output is included in [`example_digest.md`](example_digest.md).
 
+### Collection coverage
+
+The churning profile includes r/biltrewards and selects up to 100 recent posts
+per subreddit. Listings paginate when Reddit returns fewer posts per request.
+The RSS fallback requests up to 30 pages of 100 comments, within a five-minute
+budget per subreddit, with duplicate-page
+detection. Collection logs warn when limits or repeated pages prevent full coverage.
+
+Keywords match comment bodies, thread titles, and available ancestor comment bodies.
+Parent sources travel with replies into summarization; older parents are marked as
+background, not current news. RSS does not supply parent IDs, so it can use thread
+titles but cannot reconstruct reply chains. Hyphen/space variants and explicit
+compact forms (clawback, popup, shutdown, signup) match equivalently.
+
+Coverage remains bounded: Reddit may omit comments, RSS can be incomplete, and
+the existing Canadian thread-title filter still applies. More posts/comments can
+increase scraping time and the number of summarization batches. Standalone post
+bodies without comments are not collected by this comment-based pipeline.
+
+The scheduled run uses `--source-safe --quality strict`. Collection has a
+five-minute network budget per subreddit and stops RSS paging after a fully
+dated page older than the requested window. Budget exhaustion retains collected
+comments and logs a coverage warning; it does not promise exhaustive coverage.
+
+The time window is frozen at run start, before collection begins. A daily run
+starting at 18:30 selects timestamps from the previous day's 18:30 through
+today's 18:30 (source timestamps have minute precision). Slow collection no
+longer shifts the lower cutoff or includes comments posted after that endpoint.
+Undated comments are excluded from a bounded window; older ancestor comments
+may remain explicitly marked as background. A delayed/manual run uses its own
+start time, not an assumed scheduled time.
+
+Source-safe summarization uses two workers, five-minute extraction timeouts,
+four-minute writing requests, and a shared fifteen-minute AI budget. It extracts substantive notes, then writes
+one themed newsletter with emoji headings, concise bullets, useful numbers and
+source citations. Jokes, moderation chatter and empty replies are not news.
+Writing is split into batches of at most eight extracted notes instead of one
+large final request. Claude runs with explicit low reasoning effort, disabled
+skills, and no session persistence. A timed-out extraction or writing request is
+retried once, only within the same fifteen-minute total AI budget; authentication,
+quota and validation errors are not treated as transient timeouts. Logs include
+the stage, request size, attempt, timeout and elapsed time. All final source and
+quality checks remain mandatory.
+Up to two editorial correction passes are allowed for a writing part, also within
+that shared budget. Invalid claims are never accepted just to deliver an email.
+Successful responses are checkpointed by the exact prompt hash in the output's
+`.work` directory; replaying the same input/output path can reuse them. Every
+reused response still goes through source/schema validation. Failed generation
+never falls back to emailing raw comments.
+
+Codex is the default. `DIGEST_LLM_COMMAND=codex` selects the supported
+Codex CLI adapter and its saved ChatGPT login (`codex login status` to inspect).
+This consumes the account's Codex allowance, not separate API billing; usage
+limits still apply. `DIGEST_CODEX_MODEL` is an optional override; otherwise the
+CLI selects its default. Codex uses an isolated directory, read-only sandbox,
+disabled integrations/tools, and no email/API secrets in its environment.
+If Codex is absent from the background account's PATH, the script resolves the
+newest installed desktop-app CLI under LOCALAPPDATA, or the standalone install.
+It does not require the desktop app to be open.
+
+`scheduled_digest_test.py` supports a single-use, expiring diagnostic request in
+`data/codex-migration/test-request.json`. When explicitly requested, the existing
+Windows task uses saved source data, strict validation, no email and no production
+database writes, then checks SMTP authentication. It records a separate result in
+`data/codex-migration/background-verification.json`. The request is consumed before
+testing; absent/expired requests leave the normal daily workflow unchanged.
+
+For an older edition, use `--from-json <saved-raw.json> --digest-date YYYY-MM-DD`,
+with separate `--save`, `--status-file`, and `--no-db` so recovery does not replace
+the scheduled run's status. Preview with `--no-email` first. The date labels the
+edition; it does not reconstruct missing Reddit material or filter the file.
+Style follows the ten regular September 5–14, 2026 emails: source-led, compact
+bullets, bold specifics, nested offer/timeline details, and brief DP caveats.
+The reference range is 1,500–2,800 words (not a quota), with a hard 3,500-word
+limit. Up to 36 distinct topics are supported so busy days need not be forced
+into fewer sections. The renderer creates citations from source IDs, at the
+start or end of a bullet. Numeric headline claims must match sources cited in
+that same section; body and nested-bullet numbers still require their own
+line-level sources. Unsupported numeric claims trigger one repair attempt.
+There is no raw-comment fallback or appended comment archive. If generation or
+validation fails, the normal failure path runs instead of emailing raw comments.
+
+Raw author coverage remains visible as a diagnostic, not a delivery requirement:
+summaries should select useful information, not reproduce every matched author.
+Citation integrity and numeric source checks remain required. These checks do
+not independently verify Reddit claims or prove every paraphrase is correct.
+
+The watchdog waits on a running status for up to ninety minutes from the run's
+start, checking every thirty seconds. It reports completion, failure, or a stale
+run instead of flagging every run still working at the initial check time.
+Each watchdog invocation waits at most forty-five minutes so it fits within its
+scheduled-task runtime limit. SMTP connections have a thirty-second timeout.
+
 ## Architecture
 
 ```
@@ -158,19 +251,20 @@ python daily_digest.py [OPTIONS]
 
 ## Summarization Engine
 
-The digest uses an LLM to summarize scraped comments into a themed digest. It shells out to a CLI tool (default: `claude`) as a subprocess. The CLI must accept the pattern `<command> -p --model <model>`, reading the prompt from stdin and writing the summary to stdout.
+The digest uses an LLM to summarize scraped comments into a themed digest. The default provider is the signed-in Codex CLI; Claude remains an optional legacy provider. Separate adapters handle each provider's command-line arguments and structured responses.
 
 **Configuration** via environment variables or `.env`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DIGEST_LLM_COMMAND` | `claude` | CLI executable for summarization |
-| `DIGEST_LLM_MODEL` | `claude-sonnet-4-6` | Model name passed via `--model` |
+| `DIGEST_LLM_COMMAND` | `codex` | CLI executable for summarization |
+| `DIGEST_LLM_MODEL` | `claude-sonnet-4-6` | Legacy Claude model; not used by Codex |
+| `DIGEST_CODEX_MODEL` | CLI default | Optional Codex model override |
 | `DIGEST_LLM_TIMEOUT` | `1200` | Seconds to wait for summarization |
 | `DIGEST_LLM_MAX_INPUT_CHARS` | `80000` | Approximate source size per isolated batch |
 | `DIGEST_PROMPT_BODY_LIMIT` | `4000` | Per-comment prompt cap; stored source remains complete |
 
-Any CLI that accepts `-p --model <name>` with stdin/stdout can be used. The child process runs in a temporary directory with a minimal environment. When the Claude CLI is selected, project/user settings and tools are explicitly disabled. Reddit text is untrusted input, and generated Markdown is stripped of raw HTML, images, and non-Reddit links before storage or email rendering.
+The child process runs in a temporary directory with a minimal environment that excludes SMTP credentials. Codex runs with user configuration ignored, tools and integrations disabled, a read-only sandbox, and ephemeral sessions. Claude also disables settings and tools. Arbitrary replacement CLIs do not inherit these provider-specific guarantees. Reddit text is untrusted input, and generated Markdown is stripped of raw HTML, images, and non-Reddit links before storage or email rendering.
 
 The prompt tells the summarizer to:
 - Organize by theme, not by subreddit or keyword
@@ -185,12 +279,14 @@ Edit `SUMMARY_PROMPT` in `daily_digest.py` to match your use case.
 The digest is emailed automatically after each run. To enable:
 
 1. **Generate a Gmail App Password** at https://myaccount.google.com/apppasswords
-2. **Store it outside the repository and synced folders.** On Windows the default location is `%APPDATA%\reddit-digest\gmail_app_password`. You can instead set `DIGEST_GMAIL_PASSWORD_FILE` to another external path or inject `GMAIL_APP_PASSWORD` into the process environment.
+2. **Store it outside the repository and synced folders.** On Windows the default location is `%APPDATA%\reddit-digest\gmail_app_password`. You can instead set `DIGEST_GMAIL_PASSWORD_FILE` to another external path or inject `GMAIL_APP_PASSWORD` into the process environment. For background Task Scheduler runs, set `DIGEST_GMAIL_PASSWORD_FILE` in `.env` to the absolute external path if the task does not expose `APPDATA` or `USERPROFILE`; the path is safe to store there, but the password is not.
 3. Set `DIGEST_EMAIL_TO` and `DIGEST_EMAIL_FROM` in `.env` (see `.env.example`). Do not place the password in `.env`.
 
 If no password is configured, email is explicitly recorded as skipped and the digest is still saved. An attempted SMTP delivery that fails marks the whole run failed and returns a nonzero exit code.
 
 Project-local credential files and `GMAIL_APP_PASSWORD` entries in `.env` are deliberately ignored. This prevents an ignored file in a cloned or synced working tree from becoming the active secret source.
+
+All SMTP connections use certificate and hostname verification. See [SECURITY.md](SECURITY.md) for credential handling, publication checks, and security limitations.
 
 ## Email Rendering
 
@@ -270,7 +366,7 @@ Register-ScheduledTask `
 Start-ScheduledTask -TaskName "RedditDailyDigest"
 ```
 
-The batch wrapper prefers `.venv`, rotates `digest_run.log` at 5 MiB, keeps full digest text out of the log, and writes `data/last_run_status.json`. Schedule `run_watchdog.bat` separately after the expected completion time; it alerts if the run did not finish successfully, the email failed, or the digest is missing/empty.
+The batch wrapper prefers `.venv`, rotates `digest_run.log` at 5 MiB, keeps full digest text out of the log, and writes `data/last_run_status.json`. Schedule `run_watchdog.bat` separately after the expected completion time; it alerts if the run did not finish successfully, email failed or was skipped, the quality gate blocked delivery, or the digest is missing/empty.
 
 ## Standalone Scraper Usage
 
@@ -301,7 +397,10 @@ The scraper first tries old.reddit.com HTML and falls back to Reddit's RSS feeds
 - **Comment parsing** - a structured `HTMLParser` walk extracts complete bodies, score, timestamps, nesting depth, and parent IDs
 - **Rate limiting** - 1s between comment fetches, 1.5s between posts, 2s between subreddits, plus retry with backoff on HTTP 429
 - **Deduplication** - uses comment ID as the primary key, falling back to a composite hash of author + body + timestamp + post permalink when IDs are missing
-- **RSS fallback** - honors post count, sort, time window, and title filters before selecting comments
+- **RSS fallback** - paginates recent comments directly, including replies on older threads; the HTML post-count/sort settings do not restrict this feed. Preserves the fixed time window and title filters, using the feed title when available and the URL slug otherwise. A separate newest-post listing no longer discards active older threads.
+- **Bounded RSS collection** - at most 30 comment pages per subreddit, within the existing 300-second per-subreddit budget. Shared adaptive pacing respects server cooldowns; at most three attempts per request. More pages are a ceiling, not a promise of exhaustive coverage.
+- **Pacing recovery** - after three consecutive valid RSS responses, elevated request spacing decreases by 25%, with a 15-second floor for a rate-limited run. Any failed response resets the success streak; a renewed rate limit increases spacing again. Outstanding server cooldowns carry across feeds and are never shortened. This policy is not a verified safe request rate or a demonstrated coverage improvement; it still needs review against actual server rate-limit headers.
+- **Context and coverage** - known parent comments remain background-only evidence. RSS cannot supply parent IDs, and the model must not invent them. Collection gaps and RSS limitations appear in an email coverage note, a raw-data coverage sidecar, and run status.
 - **Graceful degradation** - retries transient failures and falls back from HTML to RSS; a run with no usable matches is recorded as failed rather than silently succeeding
 
 ## Output Files
@@ -310,7 +409,9 @@ Each run produces:
 
 - **`digest_YYYYMMDD_HHMM.md`** - the digest in Markdown
 - **`digest_YYYYMMDD_HHMM.json`** - raw scraped comments with metadata (when `--save-raw` is used)
+- **`digest_YYYYMMDD_HHMM.coverage.json`** - collection warnings, window and counts, preserved for saved-data replay
 - **`digest_YYYYMMDD_HHMM.evaluation.json`** - deterministic quality results
+- **`digest_YYYYMMDD_HHMM.work/`** - local-only structured model drafts for diagnosing validation failures (excluded from Git)
 - **`data/last_run_status.json`** - atomic machine-readable run, quality, and email outcome
 - **`digest_run.log`** - scheduled-run output, rotated to `digest_run.previous.log` at 5 MiB
 
@@ -365,9 +466,13 @@ reddit-digest/
 
 ## Design Tradeoffs / Limitations
 
-**Why HTML/RSS scraping instead of the Reddit API?** The project parses old.reddit.com HTML and uses RSS as a fallback to avoid OAuth credentials and API key management. The tradeoff is **markup/feed fragility and reduced RSS metadata**: Reddit changes may require parser updates, and RSS comments commonly report a score of zero. A future version could switch to PRAW or the official API.
+**Why HTML/RSS scraping instead of the Reddit API?** This implementation currently parses old.reddit.com HTML and uses RSS as a fallback. The tradeoff is **markup/feed fragility and reduced RSS metadata**: Reddit changes may require parser updates, and RSS comments commonly report a score of zero. Technical access does not establish permission to collect or reuse data. Review Reddit's current access policies before operating or expanding collection; the project does not supply approved API access or guarantee permission.
 
-**Rate limiting.** The scraper adds 1-2 second delays between requests and handles HTTP 429 with backoff. Heavy usage (many subreddits, high `--posts` counts) may still trigger Reddit's rate limiter, which slows the run but doesn't crash it.
+**Rate limiting.** HTML requests retain their existing delays. RSS starts with a shared minimum request interval and increases it after HTTP 429, honoring numeric or HTTP-date Retry-After values. A cooldown beyond the collection budget stops that feed and retains already-collected data. Time/page limits and inaccessible feeds mean completeness cannot be guaranteed; a successful email can have `completed_with_warnings` status.
+
+**Editorial safeguards.** Leading usernames identify one source, not a list of unrelated reporters. Known duplicate reports are consolidated without detaching nested details. Deterministic checks catch explicit transfer-bonus arithmetic, combined-credit totals, net costs and percentage-based spending inconsistencies. These conservative patterns are not a general fact checker; missing terms, ambiguous calculations and source misinformation still require judgment. Inconsistent calculations should be flagged or omitted, not silently replaced with invented terms.
+
+**Safe replay.** Use `--from-json <saved-comments.json> --source-safe --quality strict --no-email --no-db --digest-date YYYY-MM-DD --save data/review/replay.md --status-file data/review/status.json`. This does not scrape, send mail, or overwrite production run status. A missing coverage sidecar is disclosed as unknown original collection completeness.
 
 **Keyword false positives.** Short keywords like "ink" or "boa" use word-boundary matching (`\b`) to avoid substring hits (e.g., "thinking"), but edge cases remain. The LLM summarizer usually filters these out, but the raw JSON may contain false matches.
 

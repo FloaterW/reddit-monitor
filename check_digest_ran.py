@@ -23,6 +23,7 @@ import json
 import re
 import smtplib
 import sys
+import time
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -41,6 +42,8 @@ LOG_PATH = PROJECT_DIR / "digest_run.log"
 # The digest is scheduled for 18:30 and takes a few minutes. Before this time
 # of day there is nothing to complain about, so the watchdog stays quiet.
 DEFAULT_DUE = "19:30"
+MAX_RUNNING_MINUTES = 90
+MAX_WATCHDOG_WAIT_SECONDS = 45 * 60
 
 
 def parse_due(value):
@@ -71,7 +74,7 @@ def find_todays_digests(day=None):
 
 
 def check_run_status(status_path, day):
-    """Return (state, message): state is success, failed, or missing."""
+    """Return (state, message): success, running, failed, or missing."""
     path = Path(status_path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -85,6 +88,15 @@ def check_run_status(status_path, day):
         return "missing", f"latest status is for {payload.get('date') or 'an unknown date'}"
 
     status = payload.get("status")
+    if status == "running":
+        try:
+            started = datetime.fromisoformat(payload["started_at"])
+            age = (day.astimezone() - started.astimezone()).total_seconds() / 60
+        except (KeyError, TypeError, ValueError):
+            return "failed", "running status has no valid start time"
+        if 0 <= age < MAX_RUNNING_MINUTES:
+            return "running", f"digest still processing ({age:.0f} minutes elapsed)"
+        return "failed", "running status exceeded its grace period or has an invalid clock"
     if status not in {"completed", "completed_with_warnings"}:
         detail = payload.get("error") or f"run status is {status or 'missing'}"
         return "failed", detail
@@ -106,11 +118,15 @@ def check_run_status(status_path, day):
     email_status = payload.get("email_status")
     if email_status == "failed":
         return "failed", "digest email delivery failed"
+    if email_status == "skipped":
+        return "failed", "digest email delivery was skipped"
+    if email_status == "blocked_by_quality_gate":
+        return "failed", "digest email was blocked by the quality gate"
     return "success", f"completed digest: {digest_path.name}"
 
 
 def send_alert(day, reason="no successful run status was found"):
-    """Email a 'digest never ran' alert. Returns True if sent."""
+    """Report missing delivery without incorrectly claiming the job never started."""
     if not GMAIL_APP_PASSWORD:
         print("[SKIP] No Gmail app password configured — alert not sent.")
         return False
@@ -131,12 +147,12 @@ def send_alert(day, reason="no successful run status was found"):
     )
 
     msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = f"[MISSED] Reddit Digest did not run — {day:%B %d, %Y}"
+    msg["Subject"] = f"[MISSED] Reddit Digest not delivered — {day:%B %d, %Y}"
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
             server.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
         print(f"[OK] Missed-run alert emailed to {EMAIL_TO}")
@@ -151,11 +167,26 @@ def main(argv=None, now=None):
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--due", default=DEFAULT_DUE, help="Due time in HH:MM")
     parser.add_argument("--status-file", default=str(DEFAULT_STATUS_FILE))
+    parser.add_argument("--wait-running", action="store_true",
+                        help="Recheck an active run until completion or its bounded grace period expires")
     args = parser.parse_args(argv)
     now = now or datetime.now()
     due_hour, due_minute = parse_due(args.due)
 
     state, reason = check_run_status(args.status_file, now)
+    wait_deadline = time.monotonic() + MAX_WATCHDOG_WAIT_SECONDS
+    while state == "running" and args.wait_running:
+        if time.monotonic() >= wait_deadline:
+            state, reason = "failed", "watchdog waiting limit exceeded"
+            break
+        print(f"[WAIT] {reason}", flush=True)
+        time.sleep(30)
+        now = datetime.now()
+        state, reason = check_run_status(args.status_file, now)
+    if state == "running":
+        if not args.quiet:
+            print(f"[OK] {reason}")
+        return 0
     if state == "success":
         if not args.quiet:
             print(f"[OK] Digest succeeded for {now:%Y-%m-%d}: {reason}")

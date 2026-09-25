@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from unittest.mock import patch
 
+import pytest
+
 from check_digest_ran import (
     check_run_status,
     find_todays_digests,
@@ -65,6 +67,20 @@ class TestAtomicOutputs:
 
 
 class TestDigestRunLifecycle:
+    def test_editorial_failure_does_not_email_raw_comments(self, tmp_path):
+        raw_path = tmp_path / "source.json"
+        raw_path.write_text(json.dumps([_comment()]), encoding="utf-8")
+        with (
+            patch("daily_digest._invoke_llm", side_effect=RuntimeError("AI unavailable")),
+            patch("daily_digest.send_email") as delivery,
+        ):
+            exit_code = main(_run_args(tmp_path, raw_path, "--source-safe", "--quality", "strict"))
+        assert exit_code == 1
+        delivery.assert_not_called()
+        assert not (tmp_path / "digest.md").exists()
+        status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+        assert status["status"] == "failed"
+
     def test_success_records_quality_delivery_and_real_timestamps(self, tmp_path):
         raw_path = tmp_path / "source.json"
         raw_path.write_text(json.dumps([_comment()]), encoding="utf-8")
@@ -162,6 +178,25 @@ class TestEmailDelivery:
 
         assert _load_gmail_password() == ("external-secret", "configured file")
 
+    def test_user_profile_password_is_loaded_without_appdata(self, tmp_path, monkeypatch):
+        import daily_digest
+
+        project = tmp_path / "project"
+        project.mkdir()
+        profile = tmp_path / "profile"
+        password_file = (
+            profile / "AppData" / "Roaming" / "reddit-digest" / "gmail_app_password"
+        )
+        password_file.parent.mkdir(parents=True)
+        password_file.write_text("scheduler-secret", encoding="utf-8")
+        monkeypatch.setattr(daily_digest, "__file__", str(project / "daily_digest.py"))
+        monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
+        monkeypatch.delenv("DIGEST_GMAIL_PASSWORD_FILE", raising=False)
+        monkeypatch.delenv("APPDATA", raising=False)
+        monkeypatch.setenv("USERPROFILE", str(profile))
+
+        assert _load_gmail_password() == ("scheduler-secret", "user profile file")
+
     def test_missing_password_returns_skipped(self):
         with patch("daily_digest.GMAIL_APP_PASSWORD", ""):
             assert send_email("Digest", "# Body", ["test"]) == "skipped"
@@ -212,6 +247,37 @@ class TestWatchdogStatus:
         digest.write_text("  \n", encoding="utf-8")
         state, _ = check_run_status(status_path, datetime(2026, 9, 2, 20, 0))
         assert state == "failed"
+
+    @pytest.mark.parametrize(
+        ("email_status", "expected_reason"),
+        [
+            ("skipped", "delivery was skipped"),
+            ("failed", "delivery failed"),
+            ("blocked_by_quality_gate", "blocked by the quality gate"),
+        ],
+    )
+    def test_unsent_email_is_not_reported_as_success(
+        self, tmp_path, email_status, expected_reason
+    ):
+        digest = tmp_path / "digest.md"
+        digest.write_text("# Digest", encoding="utf-8")
+        status_path = tmp_path / "status.json"
+        status_path.write_text(
+            json.dumps({
+                "date": "2026-09-02",
+                "status": "completed_with_warnings",
+                "digest_path": str(digest),
+                "email_status": email_status,
+            }),
+            encoding="utf-8",
+        )
+
+        state, reason = check_run_status(
+            status_path, datetime(2026, 9, 2, 20, 0)
+        )
+
+        assert state == "failed"
+        assert expected_reason in reason
 
     def test_filename_fallback_ignores_empty_digest(self, tmp_path, monkeypatch):
         import check_digest_ran

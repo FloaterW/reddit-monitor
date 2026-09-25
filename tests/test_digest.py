@@ -87,13 +87,13 @@ class TestTimeAll:
 
 
 class TestRSSFallback:
-    def test_filters_comments_to_selected_posts(self):
+    def test_recent_rss_comments_are_not_restricted_to_post_listing(self):
         comments = [
             {"id": "t1_a", "_post_id": "a", "post_title": "slug a"},
             {"id": "t1_c", "_post_id": "c", "post_title": "slug c"},
         ]
         with (
-            patch("daily_digest.fetch_subreddit_posts_rss", return_value={"a": "Keep me"}) as posts,
+            patch("reddit_scraper.fetch_subreddit_posts_rss", return_value={"a": "Keep me"}) as posts,
             patch("daily_digest.fetch_subreddit_comments_rss", return_value=comments),
             patch("daily_digest.time.sleep"),
         ):
@@ -102,19 +102,20 @@ class TestRSSFallback:
                 title_filters={},
             )
 
-        posts.assert_called_once_with("test", limit=7, sort="top", time_filter="week")
-        assert [comment["id"] for comment in result] == ["t1_a"]
-        assert result[0]["post_title"] == "Keep me"
+        posts.assert_not_called()
+        assert [comment["id"] for comment in result] == ["t1_a", "t1_c"]
+        assert result[0]["post_title"] == "slug a"
         assert "_post_id" not in result[0]
+        assert "_post_id" in comments[0]  # No source mutation.
 
     def test_applies_title_filter_before_comment_selection(self):
         comments = [
-            {"id": "t1_a", "_post_id": "a", "post_title": "slug a"},
-            {"id": "t1_b", "_post_id": "b", "post_title": "slug b"},
+            {"id": "t1_a", "_post_id": "a", "post_title": "Daily thread"},
+            {"id": "t1_b", "_post_id": "b", "post_title": "Keep weekly thread"},
         ]
         with (
             patch(
-                "daily_digest.fetch_subreddit_posts_rss",
+                "reddit_scraper.fetch_subreddit_posts_rss",
                 return_value={"a": "Daily thread", "b": "Keep weekly thread"},
             ),
             patch("daily_digest.fetch_subreddit_comments_rss", return_value=comments),
@@ -225,7 +226,9 @@ class TestSummarizeErrors:
         preamble = "No skills apply here — this is a content synthesis task.\n\n"
         digest = "# Daily Digest\n\n## Section One\n\nContent here."
         fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=preamble + digest, stderr="")
-        with patch("subprocess.run", return_value=fake):
+        with patch("subprocess.run", return_value=fake), patch(
+            "daily_digest._build_llm_command", return_value=["claude", "-p"]
+        ):
             result = summarize([{"body": "test", "subreddit": "t", "post_title": "t",
                                  "author": "a", "score": 0, "created": "", "id": "",
                                  "matched_keywords": [], "depth": 0, "parent_id": "",
@@ -236,7 +239,9 @@ class TestSummarizeErrors:
     def test_preserves_clean_output(self):
         digest = "# Daily Digest\n\n## Section One\n\nContent here."
         fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=digest, stderr="")
-        with patch("subprocess.run", return_value=fake):
+        with patch("subprocess.run", return_value=fake), patch(
+            "daily_digest._build_llm_command", return_value=["claude", "-p"]
+        ):
             result = summarize([{"body": "test", "subreddit": "t", "post_title": "t",
                                  "author": "a", "score": 0, "created": "", "id": "",
                                  "matched_keywords": [], "depth": 0, "parent_id": "",
@@ -260,7 +265,9 @@ class TestPromptMonitorPropagation:
                    "author": "a", "score": 0, "created": "", "id": "",
                    "matched_keywords": [], "depth": 0, "parent_id": "",
                    "post_permalink": ""}
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.run", side_effect=fake_run), patch(
+            "daily_digest._build_llm_command", return_value=["claude", "-p"]
+        ):
             summarize([comment], **kwargs)
         return captured["prompt"]
 

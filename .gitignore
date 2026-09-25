@@ -1,9 +1,21 @@
 # Secrets — never commit real credentials
 .env
+.env.*
+!.env.example
 .gmail_app_password
+*gmail_app_password*
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite*
+*.db
+*.db-shm
+*.db-wal
 
 # Local planning docs
 COMMUNITY_INTELLIGENCE_ROADMAP.md
+.planning/
 
 # Scraper output
 *_results.json
@@ -12,6 +24,7 @@ reddit_*.json
 deep_*.json
 digest_*.md
 digest_*.json
+digest_*.work/
 
 # SQLite database
 data/
@@ -35,3 +48,7 @@ htmlcov/
 .vscode/
 .idea/
 .claude/
+.codex/
+.agents/
+.ruff_cache/
+.mypy_cache/

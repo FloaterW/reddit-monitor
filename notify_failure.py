@@ -9,6 +9,7 @@ Usage:
 """
 
 import smtplib
+import ssl
 import sys
 from collections import deque
 from datetime import datetime
@@ -53,9 +54,13 @@ def main():
         f"{'-' * 60}\n"
         f"{read_log_tail(log_path)}\n"
         f"{'-' * 60}\n\n"
-        f"If this is an authentication error, run 'claude' interactively and\n"
-        f"use /login, then rerun. To regenerate without re-scraping Reddit:\n"
-        f"  python daily_digest.py --monitor churning --from-json <raw>.json\n"
+        f"For authentication errors, check the configured provider: Claude uses\n"
+        f"its interactive /login; Codex uses 'codex login status' and 'codex login'.\n"
+        f"To preview a recovered edition without re-scraping or sending an email:\n"
+        f"  python daily_digest.py --monitor churning --from-json <raw>.json "
+        f"--digest-date YYYY-MM-DD --source-safe --quality strict --no-email --no-db "
+        f"--save data/recovery.md --status-file data/recovery.status.json\n"
+        f"Review the preview before sending. Keep the original raw file.\n"
     )
 
     msg = MIMEText(body, "plain", "utf-8")
@@ -64,7 +69,9 @@ def main():
     msg["To"] = EMAIL_TO
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com", 465, timeout=30, context=ssl.create_default_context()
+        ) as server:
             server.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
         print(f"[OK] Failure alert emailed to {EMAIL_TO}")

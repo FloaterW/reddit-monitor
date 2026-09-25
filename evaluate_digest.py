@@ -12,16 +12,20 @@ Usage:
 import json
 import re
 import sys
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
+
+from editorial_checks import editorial_issues
+from financial_checks import check_arithmetic_consistency
 
 # ---------------------------------------------------------------------------
 # Extraction helpers
 # ---------------------------------------------------------------------------
-_DOLLAR_RE = re.compile(r"\$[\d,]+(?:\.\d{1,2})?")
+_DOLLAR_RE = re.compile(r"\$\d[\d,]*(?:\.\d+)?(?:[kK]\b)?")
 _PERCENT_RE = re.compile(r"\b\d+(?:\.\d+)?%")
-_MULTIPLIER_RE = re.compile(r"\b(\d+)x\b", re.IGNORECASE)
-_POINTS_K_RE = re.compile(r"\b(\d+)k\b", re.IGNORECASE)
+_MULTIPLIER_RE = re.compile(r"\b(\d+(?:\.\d+)?)x\b", re.IGNORECASE)
+_POINTS_K_RE = re.compile(r"(?<![\w.$,])(\d+(?:\.\d+)?)k\b", re.IGNORECASE)
 _POINTS_WORD_RE = re.compile(r"\b([\d,]{3,})\s*(?:points?\b|miles?\b)", re.IGNORECASE)
 _CITATION_RE = re.compile(r"\[u/([^\]]+)\]\(([^)]+)\)")
 _REDDIT_HOSTS = {"reddit.com", "www.reddit.com", "old.reddit.com"}
@@ -29,12 +33,14 @@ _REDDIT_HOSTS = {"reddit.com", "www.reddit.com", "old.reddit.com"}
 
 def _normalize_dollar(s):
     """'$1,000.50' -> '1000.50', '$50' -> '50'"""
-    return s.replace("$", "").replace(",", "")
+    raw = s.replace("$", "").replace(",", "")
+    value = Decimal(raw[:-1]) * 1000 if raw.lower().endswith("k") else Decimal(raw)
+    return format(value.normalize(), "f")
 
 
 def extract_dollar_amounts(text):
     """Return set of normalized dollar amounts found in text."""
-    return {_normalize_dollar(m) for m in _DOLLAR_RE.findall(text)}
+    return {_normalize_dollar(m) for m in _DOLLAR_RE.findall(text.replace("*", ""))}
 
 
 def extract_percentages(text):
@@ -55,11 +61,15 @@ def extract_point_amounts(text):
     Requires either the 'k' suffix or a number with 3+ digits followed by
     'points'/'miles' to avoid matching Reddit scores like '89 pts'.
     """
+    text = text.replace("*", "")
+    # This publication name is not a unit of distance or rewards (e.g. a
+    # 'Nov 2025 Miles Per Day report' must not claim 2,025 miles).
+    text = re.sub(r"\bMiles Per Day\b", "publication", text, flags=re.IGNORECASE)
     amounts = set()
     for m in _POINTS_K_RE.finditer(text):
         raw = m.group(1)
         try:
-            amounts.add(str(int(raw) * 1000))
+            amounts.add(format((Decimal(raw) * 1000).normalize(), "f"))
         except ValueError:
             amounts.add(raw)
     for m in _POINTS_WORD_RE.finditer(text):
@@ -70,7 +80,8 @@ def extract_point_amounts(text):
 
 def extract_citations(digest_text):
     """Return list of (username, permalink) tuples from [u/name](link) patterns."""
-    return _CITATION_RE.findall(digest_text)
+    return [(author.replace(r"\_", "_"), url)
+            for author, url in _CITATION_RE.findall(digest_text)]
 
 
 def _normalize_reddit_url(value):
@@ -106,6 +117,7 @@ def _numeric_values(text):
         "percentages": extract_percentages(text),
         "multipliers": extract_multipliers(text),
         "point_amounts": extract_point_amounts(text),
+        "eligibility_ratios": set(re.findall(r"(?<![\w/])\d{1,2}/24(?!\d)", text)),
     }
 
 
@@ -234,7 +246,7 @@ def check_numeric_claims(digest_text, comments):
 
 
 def check_claim_grounding(digest_text, comments):
-    """Verify each numeric claim against source comments cited on the same line."""
+    """Ground bullets locally; H2 headlines may use citations within their section."""
     source_by_citation = {}
     for comment in comments:
         author = str(comment.get("author", "")).lower()
@@ -244,13 +256,22 @@ def check_claim_grounding(digest_text, comments):
 
     checked_count = 0
     ungrounded = []
-    for line_number, line in enumerate(digest_text.splitlines(), start=1):
+    digest_lines = digest_text.splitlines()
+    for line_number, line in enumerate(digest_lines, start=1):
         claims = _numeric_values(line)
         if not any(claims.values()):
             continue
 
         cited_bodies = []
-        for username, url in extract_citations(line):
+        citation_text = line
+        if line.startswith("## "):
+            section_lines = []
+            for following in digest_lines[line_number:]:
+                if re.match(r"^#{1,2}\s", following):
+                    break
+                section_lines.append(following)
+            citation_text += "\n" + "\n".join(section_lines)
+        for username, url in extract_citations(citation_text):
             body = source_by_citation.get(
                 (username.lower(), _normalize_reddit_url(url))
             )
@@ -325,7 +346,24 @@ def check_completeness(digest_text, comments, top_fraction=0.25):
 
 def evaluation_passed(results):
     """Return True only when every registered quality check passes."""
-    return all(result["passed"] for result in results.values())
+    return all(result["passed"] for result in results.values() if result.get("required", True))
+
+
+def check_editorial_quality(digest_text, comments):
+    sources = {(str(c.get("author", "")).lower(), _comment_url_key(c)): c.get("body", "")
+               for c in comments}
+    issues = []
+    for n, line in enumerate(digest_text.splitlines(), 1):
+        match = re.match(r"^\s*-\s+(.+)", line)
+        if not match:
+            continue
+        text = match[1]
+        bodies = [sources[(author.lower(), _normalize_reddit_url(url))]
+                  for author, url in extract_citations(text)
+                  if (author.lower(), _normalize_reddit_url(url)) in sources]
+        issues.extend({"line": n, "issue": issue} for issue in editorial_issues(
+            text, leading_source=bool(re.match(r"^\[u/", text)), source_bodies=bodies))
+    return {"passed": not issues, "issues": issues}
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +378,8 @@ def evaluate(digest_text, comments):
         "numeric_claims": check_numeric_claims(digest_text, comments),
         "claim_grounding": check_claim_grounding(digest_text, comments),
         "completeness": check_completeness(digest_text, comments),
+        "arithmetic_consistency": check_arithmetic_consistency(digest_text),
+        "editorial_quality": check_editorial_quality(digest_text, comments),
     }
 
 
@@ -348,7 +388,7 @@ def format_report(results):
     lines = []
 
     cit = results["citation_coverage"]
-    status = "PASS" if cit["passed"] else "FAIL"
+    status = "INFO" if not cit.get("required", True) else ("PASS" if cit["passed"] else "FAIL")
     lines.append(f"Citation coverage [{status}]: {cit['cited_count']}/{cit['total_authors']}"
                  f" authors cited ({cit['coverage']:.0%})")
     if cit["uncited_authors"]:
@@ -400,7 +440,7 @@ def format_report(results):
         )
 
     comp = results["completeness"]
-    status = "PASS" if comp["passed"] else "FAIL"
+    status = "INFO" if not comp.get("required", True) else ("PASS" if comp["passed"] else "FAIL")
     lines.append(f"Completeness [{status}]: {comp['covered_count']}/{comp['top_count']}"
                  f" top-scored comments represented")
     if comp["missing"]:
@@ -409,7 +449,17 @@ def format_report(results):
         if len(comp["missing"]) > 5:
             lines.append(f"  ... and {len(comp['missing']) - 5} more")
 
+    arithmetic = results.get("arithmetic_consistency", {"passed": True, "issues": []})
+    lines.append(f"Arithmetic consistency [{'PASS' if arithmetic['passed'] else 'FAIL'}]: "
+                 f"{len(arithmetic['issues'])} explicit relationship issues (not a full fact check)")
+    for issue in arithmetic["issues"][:5]:
+        lines.append(f"  - line {issue['line']}: {issue['issue']}")
     passed = evaluation_passed(results)
+    editorial = results.get("editorial_quality", {"passed": True, "issues": []})
+    lines.append(f"Editorial quality [{'PASS' if editorial['passed'] else 'FAIL'}]: "
+                 f"{len(editorial['issues'])} sentence/duration issues")
+    for issue in editorial["issues"][:5]:
+        lines.append(f"  - line {issue['line']}: {issue['issue']}")
     lines.append(f"\nOverall: {'PASS' if passed else 'FAIL'}")
 
     return "\n".join(lines)

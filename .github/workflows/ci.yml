@@ -59,6 +59,7 @@ jobs:
           --cov=evaluate_digest
           --cov=check_digest_ran
           --cov=notify_failure
+          --cov=verified_digest
           --cov-report=term
           --cov-fail-under=60
 
