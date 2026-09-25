@@ -201,7 +201,12 @@ def _parse_iso_time(iso_str: str) -> str:
     if not iso_str:
         return ""
     try:
-        dt = datetime.fromisoformat(iso_str)
+        # Python 3.10 does not accept the ISO-8601 UTC suffix directly.
+        dt = datetime.fromisoformat(
+            iso_str.removesuffix("Z") + "+00:00" if iso_str.endswith("Z") else iso_str
+        )
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
         return dt.strftime("%Y-%m-%d %H:%M UTC")
     except ValueError:
         return iso_str

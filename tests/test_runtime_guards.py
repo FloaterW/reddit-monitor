@@ -35,6 +35,18 @@ def test_rss_stops_at_old_page():
     assert fetch.call_count == 1
 
 
+@pytest.mark.parametrize("source,expected", [
+    ("2026-09-18T22:30:00Z", "2026-09-18 22:30 UTC"),
+    ("2026-09-18T22:30:00+00:00", "2026-09-18 22:30 UTC"),
+    ("2026-09-18T18:30:00-04:00", "2026-09-18 22:30 UTC"),
+    ("2026-09-19T04:00:00+05:30", "2026-09-18 22:30 UTC"),
+    ("2026-09-18T22:30:00", "2026-09-18 22:30 UTC"),
+    ("invalid", "invalid"),
+])
+def test_rss_timestamps_normalize_to_utc_on_all_supported_python_versions(source, expected):
+    assert scraper._parse_iso_time(source) == expected
+
+
 def test_unknown_timestamp_does_not_trigger_time_cutoff():
     with (
         patch.object(scraper, "_fetch_rss", side_effect=[feed("invalid"), None]) as fetch,

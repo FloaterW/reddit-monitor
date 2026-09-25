@@ -23,13 +23,14 @@ Checks included:
 | Medium — privacy | A personal email address exists in author/committer metadata in already-published history. One unpublished predecessor also used it. | New release commits use the account's GitHub no-reply identity. The unpublished predecessor is excluded from the release ancestry while its code changes are preserved. Existing public history is not rewritten by this release; coordinated cleanup remains a separate decision. |
 | Medium — prevention | Ignore rules did not cover local planning notes, environment backups, common private-key files, and databases outside `data/`. | Added exclusions and offline regression tests. Local files remain on disk, not in the release. |
 | Low | Two new test modules had import-order lint failures; README provider and page-limit text was stale. | Corrected imports and documentation. |
+| Medium — compatibility | Fresh GitHub CI found that Python 3.10 rejected RSS timestamps ending in `Z`, preventing the old-page cutoff. Nonzero offsets also needed conversion before applying a UTC label. | Normalize the UTC suffix and timezone before formatting; add direct regression cases. |
 
 No active SMTP credential, configured credential-file path, or configured private email value was found in the scanned source-file contents. The email finding is in Git metadata. Pattern-based scans can miss unknown secret formats; no credential rotation was performed because these checks did not identify a leaked active secret.
 
 ## Verification
 
-- 369 offline tests passed on Windows / Python 3.12.
-- Coverage: 78.44% across the CI-selected modules, above the 60% gate.
+- 375 offline tests passed on Windows / Python 3.12 after the CI-discovered timestamp correction.
+- Coverage: 78.45% across the CI-selected modules, above the 60% gate.
 - Ruff, compilation, and dependency consistency checks passed.
 - A live SMTP connection completed a certificate-verified TLS 1.3 handshake and returned `250` to `NOOP`. No login and no email send were performed.
 - New security tests exercise all three SMTP call sites, certificate rejection, private-file exclusions, and the publishable `.env.example` exception.
