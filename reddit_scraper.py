@@ -34,15 +34,71 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 try:
     import defusedxml.ElementTree as ET
-except ImportError:
-    import xml.etree.ElementTree as ET
+except ImportError as exc:  # pragma: no cover - dependency installation failure
+    raise RuntimeError(
+        "defusedxml is required for safe RSS parsing; install requirements.txt"
+    ) from exc
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from urllib.parse import urlparse
 
 import requests
+
+_REQUEST_DEADLINE = ContextVar("request_deadline", default=None)
+_COLLECTION_WARNINGS = ContextVar("collection_warnings", default=None)
+_RSS_PACING = ContextVar("rss_pacing", default=None)
+
+
+@contextmanager
+def collection_diagnostics():
+    """Isolate warnings and shared RSS pacing for one scrape (not process-global)."""
+    warnings = []
+    token = _COLLECTION_WARNINGS.set(warnings)
+    pacing = _RSS_PACING.set({"next": 0.0, "interval": 6.0, "successes": 0})
+    try:
+        yield warnings
+    finally:
+        _COLLECTION_WARNINGS.reset(token)
+        _RSS_PACING.reset(pacing)
+
+
+def collection_warning(subreddit, reason):
+    print(f"    WARNING: r/{subreddit}: {reason}")
+    warnings = _COLLECTION_WARNINGS.get()
+    item = {"subreddit": subreddit, "reason": reason}
+    if warnings is not None and item not in warnings:
+        warnings.append(item)
+
+
+@contextmanager
+def request_budget(seconds):
+    """Bound network requests and retry waits for one collection operation."""
+    token = _REQUEST_DEADLINE.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _REQUEST_DEADLINE.reset(token)
+
+
+def _request_timeout():
+    deadline = _REQUEST_DEADLINE.get()
+    remaining = 20 if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Collection time budget exhausted")
+    return min(20, remaining)
+
+
+def _retry_sleep(seconds):
+    deadline = _REQUEST_DEADLINE.get()
+    if deadline is not None and seconds >= deadline - time.monotonic():
+        raise TimeoutError("Retry would exceed collection time budget")
+    time.sleep(seconds)
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -82,7 +138,7 @@ def _fetch(path, params=None):
     url = f"{_BASE}{path}"
     for attempt in range(3):
         try:
-            resp = _SESSION.get(url, params=params, timeout=20)
+            resp = _SESSION.get(url, params=params, timeout=_request_timeout())
         except requests.ConnectionError:
             print("  WARNING: Could not reach Reddit — skipping this request.")
             return None
@@ -96,7 +152,7 @@ def _fetch(path, params=None):
         if resp.status_code == 429:
             wait = _parse_retry_after(resp.headers.get("Retry-After"))
             print(f"  Rate limited - waiting {wait}s...")
-            time.sleep(wait)
+            _retry_sleep(wait)
             continue
         if resp.status_code == 403:
             print("  WARNING: Reddit returned 403 — skipping this request.")
@@ -145,7 +201,12 @@ def _parse_iso_time(iso_str: str) -> str:
     if not iso_str:
         return ""
     try:
-        dt = datetime.fromisoformat(iso_str)
+        # Python 3.10 does not accept the ISO-8601 UTC suffix directly.
+        dt = datetime.fromisoformat(
+            iso_str.removesuffix("Z") + "+00:00" if iso_str.endswith("Z") else iso_str
+        )
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
         return dt.strftime("%Y-%m-%d %H:%M UTC")
     except ValueError:
         return iso_str
@@ -239,88 +300,108 @@ def _parse_search_results(html, limit):
 
 
 def _parse_comments(html, limit):
-    """Parse comment things from old.reddit comment page with depth tracking.
-
-    Uses html.parser to properly track <div> nesting so comment depth and
-    parent_id are derived from the actual DOM tree structure, not heuristics.
-    """
+    """Parse complete comment bodies with DOM-based depth and parent tracking."""
     from html.parser import HTMLParser
 
-    # Pass 1: walk the DOM to find comment IDs, depths, and parents.
-    class _DepthWalker(HTMLParser):
+    class _CommentWalker(HTMLParser):
         def __init__(self):
-            super().__init__()
+            super().__init__(convert_charrefs=True)
             self.div_stack = []
+            self.span_stack = []
             self.comment_depth = 0
             self.parent_stack = []
+            self.comment_stack = []
+            self.body_stack = []
+            self.score_stack = []
             self.results = []
 
         def handle_starttag(self, tag, attrs):
+            attr_map = dict(attrs)
+            if tag == "time" and self.comment_stack:
+                current = self.comment_stack[-1]
+                if current is not None:
+                    current["created"] = _parse_iso_time(attr_map.get("datetime", ""))
+                return
+
+            if tag == "span":
+                classes = set(attr_map.get("class", "").split())
+                target = self.comment_stack[-1] if self.comment_stack and "score" in classes else None
+                self.span_stack.append(target)
+                if target is not None:
+                    self.score_stack.append(target)
+                return
+
+            if tag in {"br", "p", "li"} and self.body_stack:
+                self.body_stack[-1]["_body_parts"].append("\n")
+
             if tag != "div":
                 return
-            a = dict(attrs)
-            cls = a.get("class", "")
+
+            classes = set(attr_map.get("class", "").split())
             div_role = None
 
-            if "sitetable" in cls and a.get("id", "").startswith("siteTable_t1_"):
+            if "sitetable" in classes and attr_map.get("id", "").startswith("siteTable_t1_"):
                 div_role = "sitetable"
-                parent_id = "t1_" + a["id"][len("siteTable_t1_"):]
+                parent_id = "t1_" + attr_map["id"][len("siteTable_t1_"):]
                 self.comment_depth += 1
                 self.parent_stack.append(parent_id)
-            elif a.get("data-type") == "comment":
+            elif attr_map.get("data-type") == "comment":
                 div_role = "comment"
-                self.results.append({
-                    "id": a.get("data-fullname", ""),
-                    "author": a.get("data-author", ""),
-                    "depth": self.comment_depth,
-                    "parent_id": self.parent_stack[-1] if self.parent_stack else "",
-                    "pos": self.getpos(),
-                })
+                current = None
+                if len(self.results) < limit:
+                    current = {
+                        "id": attr_map.get("data-fullname", ""),
+                        "author": _author_name(attr_map.get("data-author", "")),
+                        "score": 0,
+                        "body": "",
+                        "created": "",
+                        "depth": self.comment_depth,
+                        "parent_id": self.parent_stack[-1] if self.parent_stack else "",
+                        "_body_parts": [],
+                    }
+                    self.results.append(current)
+                self.comment_stack.append(current)
+            elif "md" in classes and self.comment_stack:
+                current = self.comment_stack[-1]
+                if current is not None:
+                    div_role = "body"
+                    self.body_stack.append(current)
 
             self.div_stack.append(div_role)
 
         def handle_endtag(self, tag):
+            if tag == "span" and self.span_stack:
+                target = self.span_stack.pop()
+                if target is not None and self.score_stack:
+                    self.score_stack.pop()
+                return
             if tag != "div" or not self.div_stack:
                 return
             role = self.div_stack.pop()
-            if role == "sitetable":
+            if role == "body" and self.body_stack:
+                self.body_stack.pop()
+            elif role == "comment" and self.comment_stack:
+                self.comment_stack.pop()
+            elif role == "sitetable":
                 self.comment_depth -= 1
                 if self.parent_stack:
                     self.parent_stack.pop()
 
-    walker = _DepthWalker()
+        def handle_data(self, data):
+            if self.body_stack:
+                self.body_stack[-1]["_body_parts"].append(data)
+            if self.score_stack:
+                score_match = re.search(r"(-?[\d,]+)\s*point", data, re.IGNORECASE)
+                if score_match:
+                    self.score_stack[-1]["score"] = int(score_match.group(1).replace(",", ""))
+
+    walker = _CommentWalker()
     walker.feed(html)
-    tree_info = {r["id"]: r for r in walker.results}
-
-    # Pass 2: extract body / score / time via regex (faster than parsing).
-    results = []
-    for m in re.finditer(r'<div[^>]*data-type="comment"[^>]*>', html):
-        if len(results) >= limit:
-            break
-
-        tag = m.group()
-        fullname_m = re.search(r'data-fullname="([^"]*)"', tag)
-        comment_id = fullname_m.group(1) if fullname_m else ""
-        info = tree_info.get(comment_id, {})
-
-        author_m = re.search(r'data-author="([^"]*)"', tag)
-        chunk = html[m.end() : m.end() + 2000]
-        score_m = re.search(r'class="[^"]*score[^"]*"[^>]*>(\d+)\s*point', chunk)
-        time_m = re.search(r'<time[^>]*datetime="([^"]+)"', chunk)
-        body_m = re.search(r'<div class="md">(.*?)</div>', chunk, re.DOTALL)
-
-        entry = {
-            "id": comment_id,
-            "author": _author_name(author_m.group(1) if author_m else None),
-            "score": int(score_m.group(1)) if score_m else 0,
-            "body": _truncate(_strip_html(body_m.group(1)) if body_m else "", 500),
-            "created": _parse_iso_time(time_m.group(1) if time_m else ""),
-            "depth": info.get("depth", 0),
-            "parent_id": info.get("parent_id", ""),
-        }
-        results.append(entry)
-
-    return results
+    for result in walker.results:
+        result["body"] = re.sub(
+            r"\s+", " ", "".join(result.pop("_body_parts", []))
+        ).strip()
+    return walker.results
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +500,19 @@ def get_post_comments(post_url, limit=20, sort="top"):
 # 4. DEEP SEARCH (scan comments inside posts)
 # ---------------------------------------------------------------------------
 def _matches_query(query_lower, text, use_word_boundary=True):
+    # Normalize separator variants without removing word boundaries globally.
+    # Compact forms are explicit to avoid matching unrelated joined words.
+    aliases = {
+        "clawback": "claw back", "popup": "pop up", "shutdown": "shut down",
+        "signup": "sign up",
+    }
+    def normalize(value):
+        value = re.sub(r"[-\u2010-\u2015\s]+", " ", value.casefold())
+        for compact, expanded in aliases.items():
+            value = re.sub(r"\b" + compact + r"\b", expanded, value)
+        return value
+
+    query_lower, text = normalize(query_lower), normalize(text)
     if use_word_boundary:
         return bool(re.search(r'\b' + re.escape(query_lower) + r'\b', text, re.IGNORECASE))
     return query_lower in text.lower()
@@ -577,31 +671,77 @@ _RSS_SESSION.headers.update({
 def _fetch_rss(path, params=None):
     """Fetch an RSS/Atom feed and return the XML root element, or None."""
     url = f"{_RSS_BASE}{path}"
-    for attempt in range(5):
+    pacing = _RSS_PACING.get()
+    for attempt in range(3):
+        if pacing:
+            wait = pacing["next"] - time.monotonic()
+            if wait > 0:
+                _retry_sleep(wait)
         try:
-            resp = _RSS_SESSION.get(url, params=params, timeout=20)
+            resp = _RSS_SESSION.get(url, params=params, timeout=_request_timeout())
         except (requests.ConnectionError, requests.Timeout):
-            if attempt < 4:
-                time.sleep(3 * (attempt + 1))
+            if pacing:
+                pacing["successes"] = 0
+            if attempt < 2:
+                _retry_sleep(3 * (attempt + 1))
                 continue
             return None
 
+        if pacing:
+            pacing["next"] = time.monotonic() + pacing["interval"]
+
         if resp.status_code == 429:
-            wait = _parse_retry_after(
-                resp.headers.get("Retry-After"), 15 + 10 * attempt,
-            )
+            wait = _rss_retry_delay(resp.headers.get("Retry-After"), 30 * (attempt + 1))
+            if pacing:
+                pacing["successes"] = 0
+                pacing["interval"] = min(60.0, max(15.0, pacing["interval"] * 2))
+                pacing["next"] = time.monotonic() + max(wait, pacing["interval"])
+            if attempt == 2:
+                # Do not spend the remaining budget sleeping without a retry.
+                return None
             print(f"    RSS rate limited — waiting {wait}s...")
-            time.sleep(wait)
+            if not pacing:
+                _retry_sleep(wait)
             continue
         if resp.status_code != 200:
+            if pacing:
+                pacing["successes"] = 0
             return None
 
         try:
-            return ET.fromstring(resp.content)
+            root = ET.fromstring(resp.content)
         except ET.ParseError:
+            if pacing:
+                pacing["successes"] = 0
             return None
 
+        if pacing:
+            pacing["successes"] = pacing.get("successes", 0) + 1
+            if pacing["successes"] >= 3:
+                # Recover cautiously after sustained valid responses. Keep a
+                # slower floor for the rest of a rate-limited run. The preceding
+                # request already honored any outstanding server cooldown.
+                pacing["successes"] = 0
+                if pacing["interval"] > 15.0:
+                    pacing["interval"] = max(15.0, pacing["interval"] * 0.75)
+            pacing["next"] = time.monotonic() + pacing["interval"]
+        return root
+
     return None
+
+
+def _rss_retry_delay(value, default):
+    """Honor server cooldowns, including HTTP dates; budget guards bound waits."""
+    try:
+        return max(0, int(value))
+    except (ValueError, TypeError):
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0, (date - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return default
 
 
 def _rss_entry_to_comment(entry):
@@ -616,7 +756,7 @@ def _rss_entry_to_comment(entry):
     updated = entry.findtext("atom:updated", "", _RSS_NS)
     entry_id = entry.findtext("atom:id", "", _RSS_NS)
     content_html = entry.findtext("atom:content", "", _RSS_NS)
-    body = _truncate(_strip_html(content_html), 500) if content_html else ""
+    body = _strip_html(content_html) if content_html else ""
 
     parts = permalink.rstrip("/").split("/")
     subreddit = post_id = post_slug = ""
@@ -636,6 +776,12 @@ def _rss_entry_to_comment(entry):
         )
 
     post_title = post_slug.replace("_", " ").title() if post_slug else ""
+    feed_title = entry.findtext("atom:title", "", _RSS_NS)
+    # Reddit's comment-feed title is '<author> on <thread title>'. Do not
+    # pretend a slug or an arbitrary Atom title supplies a parent comment.
+    prefix = re.match(r"^(?:/?u/)?" + re.escape(author) + r" on (.+)$", feed_title, re.I) if author else None
+    if prefix:
+        post_title = prefix.group(1)
 
     return {
         "id": entry_id,
@@ -645,6 +791,8 @@ def _rss_entry_to_comment(entry):
         "created": _parse_iso_time(updated),
         "depth": 0,
         "parent_id": "",
+        "context_status": "unavailable_rss",
+        "title_source": "feed" if prefix else "slug",
         "subreddit": subreddit,
         "post_title": post_title,
         "post_permalink": post_permalink,
@@ -652,53 +800,113 @@ def _rss_entry_to_comment(entry):
     }
 
 
-def fetch_subreddit_comments_rss(subreddit, max_pages=3, per_page=100):
+def fetch_subreddit_comments_rss(subreddit, max_pages=30, per_page=100, cutoff=None):
     """Fetch recent comments from a subreddit via RSS with pagination."""
     all_comments = []
     after = None
+    seen = set()
 
     for page in range(max_pages):
         params = {"limit": per_page}
         if after:
             params["after"] = after
 
-        root = _fetch_rss(f"/r/{subreddit}/comments/.rss", params)
+        try:
+            root = _fetch_rss(f"/r/{subreddit}/comments/.rss", params)
+        except TimeoutError:
+            collection_warning(subreddit, "collection budget reached; keeping collected comments.")
+            break
         if root is None:
+            collection_warning(subreddit, "comment feed unavailable or retries exhausted; coverage is incomplete.")
             break
 
         entries = root.findall("atom:entry", _RSS_NS)
         if not entries:
+            if cutoff is not None:
+                collection_warning(subreddit, "RSS ended before the requested time boundary was confirmed; coverage is incomplete.")
             break
 
+        added = 0
+        page_times = []
         for e in entries:
-            all_comments.append(_rss_entry_to_comment(e))
+            comment = _rss_entry_to_comment(e)
+            try:
+                page_times.append(datetime.strptime(comment["created"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc))
+            except ValueError:
+                page_times.append(None)
+            key = _dedup_key(comment)
+            if key not in seen:
+                seen.add(key)
+                all_comments.append(comment)
+                added += 1
+        # Recent-comment feeds are newest-first. Require a fully dated, old
+        # page; a mixed page or unknown timestamp must not hide newer replies.
+        if cutoff is not None and page_times and all(t is not None and t < cutoff for t in page_times):
+            print(f"    r/{subreddit}: reached comments older than the requested window.")
+            break
+        if not added:
+            collection_warning(subreddit, "RSS repeated a page; coverage is incomplete.")
+            break
 
         after = entries[-1].findtext("atom:id", None, _RSS_NS)
-        if not after or len(entries) < per_page:
+        if not after:
+            collection_warning(subreddit, "RSS pagination cursor missing; coverage is incomplete.")
             break
 
-        time.sleep(5)
+        try:
+            _retry_sleep(5)
+        except TimeoutError:
+            collection_warning(subreddit, "collection budget reached; keeping collected comments.")
+            break
+    else:
+        collection_warning(subreddit, f"RSS reached the {max_pages}-page limit; older comments may be missing.")
 
     return all_comments
 
 
-def fetch_subreddit_posts_rss(subreddit, limit=25):
+def fetch_subreddit_posts_rss(subreddit, limit=25, sort="new", time_filter="day"):
     """Fetch post titles from a subreddit via RSS.
 
     Returns a dict mapping post_id -> title for enriching comment data.
     """
-    params = {"limit": limit}
-    root = _fetch_rss(f"/r/{subreddit}/.rss", params)
-    if root is None:
-        return {}
-
+    params = {"limit": min(limit, 100)}
+    if sort == "top":
+        params["t"] = time_filter
+    suffix = "" if sort == "hot" else f"/{sort}"
     titles = {}
-    for entry in root.findall("atom:entry", _RSS_NS):
-        entry_id = entry.findtext("atom:id", "", _RSS_NS)
-        title = entry.findtext("atom:title", "", _RSS_NS)
-        post_id = entry_id.removeprefix("t3_")
-        if post_id and title:
-            titles[post_id] = title
+    for _ in range(10):
+        try:
+            root = _fetch_rss(f"/r/{subreddit}{suffix}/.rss", dict(params))
+        except TimeoutError:
+            print(f"    WARNING: r/{subreddit} post collection budget reached.")
+            break
+        if root is None:
+            break
+        entries = root.findall("atom:entry", _RSS_NS)
+        if not entries:
+            break
+        previous_count = len(titles)
+        for entry in entries:
+            entry_id = entry.findtext("atom:id", "", _RSS_NS)
+            title = entry.findtext("atom:title", "", _RSS_NS)
+            post_id = entry_id.removeprefix("t3_")
+            if post_id and title:
+                titles[post_id] = title
+            if len(titles) >= limit:
+                return titles
+        if len(titles) == previous_count:
+            print(f"    WARNING: r/{subreddit} post RSS repeated a page; coverage is incomplete.")
+            break
+        after = entries[-1].findtext("atom:id", "", _RSS_NS)
+        if not after:
+            break
+        params["after"] = after
+        try:
+            _retry_sleep(5)
+        except TimeoutError:
+            break
+    else:
+        print(f"    WARNING: r/{subreddit} post RSS reached its pagination limit.")
 
     return titles
 
@@ -880,7 +1088,8 @@ def main():
         if args.command == "search":
             print("Tip: try --sort relevance, widen --time (e.g. all), or simplify the query.")
 
-    save_to_json(payload, output)
+    if not save_to_json(payload, output):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

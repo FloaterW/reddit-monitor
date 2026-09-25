@@ -1,5 +1,10 @@
 """Tests for storage.py — SQLite run history."""
 
+import sqlite3
+from datetime import datetime, timezone
+
+import pytest
+
 from storage import DigestDB
 
 
@@ -170,6 +175,76 @@ class TestDigestDB:
         runs = db.get_runs()
         assert runs[0]["raw_comment_count"] == 500
         assert runs[0]["matched_comment_count"] == 2
+        db.close()
+
+    def test_persists_run_lifecycle_fields(self, tmp_path):
+        db = DigestDB(tmp_path / "test.db")
+        started = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        completed = datetime(2026, 9, 2, 12, 5, tzinfo=timezone.utc)
+        db.save_run(
+            "test",
+            "day",
+            5,
+            _sample_comments(),
+            started_at=started,
+            completed_at=completed,
+            status="failed",
+            email_status="failed",
+            quality_status="passed",
+            error="SMTP delivery failed",
+        )
+
+        run = db.get_runs()[0]
+        assert run["started_at"] == started.isoformat()
+        assert run["completed_at"] == completed.isoformat()
+        assert run["status"] == "failed"
+        assert run["email_status"] == "failed"
+        assert run["quality_status"] == "passed"
+        assert run["error"] == "SMTP delivery failed"
+        db.close()
+
+    def test_failed_save_rolls_back_entire_run(self, tmp_path):
+        db = DigestDB(tmp_path / "test.db")
+        invalid = _sample_comments()
+        invalid[1]["score"] = object()
+
+        with pytest.raises(sqlite3.Error):
+            db.save_run("bad", "day", 5, invalid)
+
+        good_run_id = db.save_run("good", "day", 5, _sample_comments())
+        runs = db.get_runs()
+        assert len(runs) == 1
+        assert runs[0]["id"] == good_run_id
+        assert runs[0]["monitor_name"] == "good"
+        assert len(db.get_run_comments(good_run_id)) == 2
+        db.close()
+
+    def test_migrates_existing_runs_table(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            "CREATE TABLE runs ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "monitor_name TEXT NOT NULL, started_at TEXT NOT NULL, "
+            "time_filter TEXT NOT NULL, posts_per_subreddit INTEGER NOT NULL, "
+            "raw_comment_count INTEGER NOT NULL, "
+            "matched_comment_count INTEGER NOT NULL, digest_path TEXT, "
+            "raw_json_path TEXT)"
+        )
+        connection.commit()
+        connection.close()
+
+        db = DigestDB(db_path)
+        columns = {
+            row["name"] for row in db.conn.execute("PRAGMA table_info(runs)")
+        }
+        assert {
+            "completed_at",
+            "status",
+            "email_status",
+            "quality_status",
+            "error",
+        } <= columns
         db.close()
 
     def test_empty_comments(self, tmp_path):

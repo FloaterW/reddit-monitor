@@ -2,6 +2,8 @@
 
 from evaluate_digest import (
     check_citation_coverage,
+    check_citation_integrity,
+    check_claim_grounding,
     check_completeness,
     check_dollar_amounts,
     check_numeric_claims,
@@ -12,6 +14,16 @@ from evaluate_digest import (
     extract_percentages,
     extract_point_amounts,
 )
+
+
+def _source_comment(author="alice", comment_id="t1_aaa", body="source", score=1):
+    return {
+        "author": author,
+        "id": comment_id,
+        "post_permalink": "https://reddit.com/r/test/comments/post/title/",
+        "body": body,
+        "score": score,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +160,31 @@ class TestCitationCoverage:
         assert result["cited_count"] == 1
 
 
+class TestCitationIntegrity:
+    def test_matching_author_and_comment_url_passes(self):
+        digest = (
+            "[u/alice](https://www.reddit.com/r/test/comments/post/title/aaa/)"
+        )
+        result = check_citation_integrity(digest, [_source_comment()])
+        assert result["passed"]
+        assert result["valid_count"] == 1
+
+    def test_external_url_fails(self):
+        digest = "[u/alice](https://evil.example/fake)"
+        result = check_citation_integrity(digest, [_source_comment()])
+        assert not result["passed"]
+
+    def test_wrong_source_comment_url_fails(self):
+        digest = "[u/alice](https://reddit.com/r/test/comments/post/title/wrong/)"
+        result = check_citation_integrity(digest, [_source_comment()])
+        assert not result["passed"]
+
+    def test_right_url_wrong_author_fails(self):
+        digest = "[u/bob](https://reddit.com/r/test/comments/post/title/aaa/)"
+        result = check_citation_integrity(digest, [_source_comment()])
+        assert not result["passed"]
+
+
 # ---------------------------------------------------------------------------
 # Dollar amounts
 # ---------------------------------------------------------------------------
@@ -207,6 +244,35 @@ class TestNumericClaims:
         assert result["passed"]
 
 
+class TestClaimGrounding:
+    def test_claim_on_cited_line_matches_that_comment(self):
+        digest = (
+            "[u/alice](https://reddit.com/r/test/comments/post/title/aaa/) "
+            "reported a $50 credit and 20% bonus"
+        )
+        comments = [_source_comment(body="I received $50 with a 20% bonus")]
+        result = check_claim_grounding(digest, comments)
+        assert result["passed"]
+        assert result["checked_count"] == 2
+
+    def test_value_existing_only_in_different_comment_fails(self):
+        digest = (
+            "[u/alice](https://reddit.com/r/test/comments/post/title/aaa/) "
+            "reported a $500 credit"
+        )
+        comments = [
+            _source_comment(body="I received $50"),
+            _source_comment("bob", "t1_bbb", "I received $500"),
+        ]
+        result = check_claim_grounding(digest, comments)
+        assert not result["passed"]
+        assert result["ungrounded"][0]["value"] == "500"
+
+    def test_uncited_numeric_claim_fails(self):
+        result = check_claim_grounding("A 50% bonus exists", [_source_comment()])
+        assert not result["passed"]
+
+
 # ---------------------------------------------------------------------------
 # Completeness
 # ---------------------------------------------------------------------------
@@ -253,6 +319,11 @@ class TestCompleteness:
         result = check_completeness(digest, comments)
         assert result["passed"]
 
+    def test_author_substring_does_not_count_as_coverage(self):
+        comments = [{"author": "ann", "score": 10, "body": "Important"}]
+        result = check_completeness("u/annette discussed it", comments)
+        assert not result["passed"]
+
 
 # ---------------------------------------------------------------------------
 # Full evaluation
@@ -265,13 +336,21 @@ class TestEvaluate:
             "with **20%** bonus. [u/bob](https://reddit.com/r/test/b) confirmed."
         )
         comments = [
-            {"author": "alice", "score": 20, "body": "Got the $50 credit with 20% bonus"},
-            {"author": "bob", "score": 15, "body": "Can confirm the $50 and 20% deal"},
+            {
+                **_source_comment("alice", "t1_a", "Got the $50 credit with 20% bonus", 20),
+                "post_permalink": "https://reddit.com/r/test/",
+            },
+            {
+                **_source_comment("bob", "t1_b", "Can confirm the $50 and 20% deal", 15),
+                "post_permalink": "https://reddit.com/r/test/",
+            },
         ]
         results = evaluate(digest, comments)
         assert results["citation_coverage"]["passed"]
+        assert results["citation_integrity"]["passed"]
         assert results["dollar_amounts"]["passed"]
         assert results["numeric_claims"]["passed"]
+        assert results["claim_grounding"]["passed"]
         assert results["completeness"]["passed"]
 
     def test_bad_digest_fails(self):

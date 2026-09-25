@@ -1,0 +1,10 @@
+# Fully resolved runtime environment. Regenerate after changing requirements.txt.
+bleach==6.4.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+defusedxml==0.7.1
+idna==3.19
+Markdown==3.10.3
+requests==2.34.2
+urllib3==2.7.0
+webencodings==0.6.1

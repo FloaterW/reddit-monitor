@@ -1,0 +1,19 @@
+{
+  "notes": [
+    {"topic": "Interview process", "text": "A candidate describes an individual junior backend interview experience at fictional ExampleCo.", "source_ids": ["t1_demoa"]},
+    {"topic": "Remote work uncertainty", "text": "A fictional SampleWorks team is discussing hybrid work, without an announced company policy or effective date.", "source_ids": ["t1_demob"]},
+    {"topic": "Graduate applications", "text": "A candidate received a coding assessment invitation from fictional DemoLabs, not an offer.", "source_ids": ["t1_democ"]}
+  ],
+  "sections": [
+    {"title": "Interview process — fictional ExampleCo", "bullets": [
+      {"text": "reports that a recruiter described **two technical interviews and a team conversation** for a junior backend role at fictional ExampleCo. This is an individual experience, not verified company-wide policy.", "source_ids": ["t1_demoa"], "source_position": "start", "indent": 0}
+    ]},
+    {"title": "Remote-work uncertainty — fictional SampleWorks", "bullets": [
+      {"text": "reports a team discussion about **hybrid work** at fictional SampleWorks. No written company policy or effective date has been announced.", "source_ids": ["t1_demob"], "source_position": "start", "indent": 0},
+      {"text": "Whether remote employees would be affected remains an **unanswered question**.", "source_ids": ["t1_demob"], "source_position": "end", "indent": 1}
+    ]},
+    {"title": "Graduate applications — fictional DemoLabs", "bullets": [
+      {"text": "reports receiving a **coding assessment invitation** for a new grad role at fictional DemoLabs, not an offer. One invitation does not establish a broader hiring trend.", "source_ids": ["t1_democ"], "source_position": "start", "indent": 0}
+    ]}
+  ]
+}

@@ -1,0 +1,44 @@
+[
+  {
+    "id": "t1_demoa",
+    "author": "demo_candidate",
+    "subreddit": "cscareerquestions",
+    "post_title": "Fictional ExampleCo interview process",
+    "post_permalink": "https://reddit.com/r/cscareerquestions/comments/demo1/example_interview/",
+    "body": "Synthetic example: I interviewed for a junior backend role at fictional ExampleCo. The recruiter described two technical interviews and a team conversation. This is my experience, not a verified company-wide policy.",
+    "created": "2026-01-01 12:00 UTC",
+    "score": 10,
+    "depth": 0,
+    "parent_id": "",
+    "matched_keywords": ["interview", "junior"],
+    "context_status": "not_required"
+  },
+  {
+    "id": "t1_demob",
+    "author": "demo_engineer",
+    "subreddit": "experienceddevs",
+    "post_title": "Fictional SampleWorks remote arrangement",
+    "post_permalink": "https://reddit.com/r/experienceddevs/comments/demo2/example_remote/",
+    "body": "Synthetic example: My team at fictional SampleWorks is discussing a hybrid arrangement. No written company policy or effective date has been announced. I asked whether remote employees would be affected; there is no answer yet.",
+    "created": "2026-01-01 13:00 UTC",
+    "score": 8,
+    "depth": 0,
+    "parent_id": "",
+    "matched_keywords": ["remote", "hybrid"],
+    "context_status": "not_required"
+  },
+  {
+    "id": "t1_democ",
+    "author": "demo_graduate",
+    "subreddit": "csMajors",
+    "post_title": "Fictional DemoLabs graduate application",
+    "post_permalink": "https://reddit.com/r/csMajors/comments/demo3/example_application/",
+    "body": "Synthetic example: I applied to a new grad role at fictional DemoLabs and received an invitation to a coding assessment. I have not received an offer. One invitation does not establish a wider hiring trend.",
+    "created": "2026-01-01 14:00 UTC",
+    "score": 6,
+    "depth": 0,
+    "parent_id": "",
+    "matched_keywords": ["new grad", "hiring"],
+    "context_status": "not_required"
+  }
+]
