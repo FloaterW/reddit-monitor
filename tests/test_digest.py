@@ -169,8 +169,11 @@ class TestFormatComments:
             "post_permalink": "https://reddit.com/r/churning/comments/xyz/test/",
         }]
         text = format_comments_for_prompt(comments)
-        assert "abc" in text
-        assert "reddit.com" in text
+        permalinks = [
+            line.removeprefix("Permalink: ")
+            for line in text.splitlines() if line.startswith("Permalink: ")
+        ]
+        assert permalinks == ["https://reddit.com/r/churning/comments/xyz/test/abc/"]
 
     def test_handles_missing_id(self):
         comments = [{
@@ -181,7 +184,11 @@ class TestFormatComments:
             "post_permalink": "https://reddit.com/r/churning/comments/xyz/test/",
         }]
         text = format_comments_for_prompt(comments)
-        assert "reddit.com" in text
+        permalinks = [
+            line.removeprefix("Permalink: ")
+            for line in text.splitlines() if line.startswith("Permalink: ")
+        ]
+        assert permalinks == ["https://reddit.com/r/churning/comments/xyz/test/"]
 
 
 # ---------------------------------------------------------------------------

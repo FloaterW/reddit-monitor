@@ -1,5 +1,7 @@
 """Tests for reddit_scraper.py — HTML parsing, keyword matching, dedup."""
 
+from urllib.parse import urlparse
+
 from reddit_scraper import (
     _dedup_key,
     _matches_query,
@@ -108,8 +110,9 @@ class TestParseSearchResults:
     def test_normalizes_permalink(self, search_html):
         results = _parse_search_results(search_html, limit=10)
         for r in results:
-            assert "old.reddit.com" not in r["permalink"]
-            assert r["permalink"].startswith("https://reddit.com")
+            parsed = urlparse(r["permalink"])
+            assert parsed.scheme == "https"
+            assert parsed.netloc == "reddit.com"
 
 
 # ---------------------------------------------------------------------------
