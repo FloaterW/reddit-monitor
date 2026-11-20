@@ -1,6 +1,10 @@
 """Tests for reddit_scraper.py — HTML parsing, keyword matching, dedup."""
 
+from datetime import datetime, timezone
+from unittest.mock import patch
 from urllib.parse import urlparse
+
+import pytest
 
 from reddit_scraper import (
     _dedup_key,
@@ -182,11 +186,13 @@ class TestParseRetryAfter:
     def test_numeric_seconds(self):
         assert _parse_retry_after("30") == 30
 
-    def test_capped_at_120(self):
-        assert _parse_retry_after("999") == 120
+    def test_long_cooldown_is_not_shortened(self):
+        assert _parse_retry_after("999") == 999
 
-    def test_http_date_falls_back(self):
-        assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT") == 60
+    def test_http_date_preserves_server_cooldown(self):
+        with patch("reddit_scraper.datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 21, 7, 18, tzinfo=timezone.utc)
+            assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT") == 600
 
     def test_missing_header_falls_back(self):
         assert _parse_retry_after(None) == 60
@@ -210,7 +216,7 @@ class TestFetchRetryAfter:
         import reddit_scraper as rs
 
         responses = [
-            _FakeResponse(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            _FakeResponse(429, headers={"Retry-After": "not a valid HTTP date"}),
             _FakeResponse(200, text="<html>ok</html>"),
         ]
         monkeypatch.setattr(rs._SESSION, "get", lambda *a, **k: responses.pop(0))
@@ -219,6 +225,45 @@ class TestFetchRetryAfter:
 
         assert rs._fetch("/r/test/") == "<html>ok</html>"
         assert sleeps == [60]
+
+    @pytest.mark.parametrize("retry_after", ["999", "Wed, 21 Oct 2026 07:28:00 GMT"])
+    def test_server_wait_beyond_budget_stops_without_retry(self, retry_after):
+        import reddit_scraper as rs
+
+        with (
+            patch.object(rs, "datetime") as clock,
+            patch.object(rs.time, "monotonic", return_value=0),
+            patch.object(rs.time, "sleep") as sleep,
+            patch.object(rs._SESSION, "get", return_value=_FakeResponse(429, headers={"Retry-After": retry_after})) as get,
+            rs.request_budget(300),
+        ):
+            clock.now.return_value = datetime(2026, 10, 21, 7, 18, tzinfo=timezone.utc)
+            with pytest.raises(TimeoutError, match="budget"):
+                rs._fetch("/r/test/")
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    def test_standalone_request_skips_long_cooldown_instead_of_shortening_it(self):
+        import reddit_scraper as rs
+
+        with (
+            patch.object(rs._SESSION, "get", return_value=_FakeResponse(429, headers={"Retry-After": "999"})) as get,
+            patch.object(rs.time, "sleep") as sleep,
+        ):
+            assert rs._fetch("/r/test/") is None
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    def test_last_failed_attempt_does_not_sleep_without_another_retry(self):
+        import reddit_scraper as rs
+
+        with (
+            patch.object(rs._SESSION, "get", return_value=_FakeResponse(429, headers={"Retry-After": "5"})) as get,
+            patch.object(rs.time, "sleep") as sleep,
+        ):
+            assert rs._fetch("/r/test/") is None
+        assert get.call_count == 3
+        assert [call.args[0] for call in sleep.call_args_list] == [5, 5]
 
 
 # ---------------------------------------------------------------------------

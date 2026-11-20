@@ -22,6 +22,7 @@ import argparse
 import json
 import re
 import smtplib
+import ssl
 import sys
 import time
 from datetime import datetime
@@ -80,14 +81,21 @@ def check_run_status(status_path, day):
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return "missing", f"status file not found: {path}"
-    except (json.JSONDecodeError, OSError) as exc:
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
         return "failed", f"status file is unreadable: {exc}"
+
+    if not isinstance(payload, dict):
+        return "failed", "status file must contain a JSON object"
 
     expected_date = day.date().isoformat()
     if payload.get("date") != expected_date:
         return "missing", f"latest status is for {payload.get('date') or 'an unknown date'}"
+    if "edition_date" in payload and payload["edition_date"] != expected_date:
+        return "missing", "latest run is for a different digest edition, not today's delivery"
 
     status = payload.get("status")
+    if not isinstance(status, str):
+        return "failed", "run status must be a string"
     if status == "running":
         try:
             started = datetime.fromisoformat(payload["started_at"])
@@ -102,7 +110,7 @@ def check_run_status(status_path, day):
         return "failed", detail
 
     digest_value = payload.get("digest_path")
-    if not digest_value:
+    if not isinstance(digest_value, str) or not digest_value.strip():
         return "failed", "successful status does not name a digest file"
     digest_path = Path(digest_value)
     if not digest_path.is_absolute():
@@ -122,6 +130,8 @@ def check_run_status(status_path, day):
         return "failed", "digest email delivery was skipped"
     if email_status == "blocked_by_quality_gate":
         return "failed", "digest email was blocked by the quality gate"
+    if email_status != "sent":
+        return "failed", "digest email delivery is not confirmed as sent"
     return "success", f"completed digest: {digest_path.name}"
 
 
@@ -152,7 +162,9 @@ def send_alert(day, reason="no successful run status was found"):
     msg["To"] = EMAIL_TO
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com", 465, timeout=30, context=ssl.create_default_context()
+        ) as server:
             server.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
         print(f"[OK] Missed-run alert emailed to {EMAIL_TO}")
@@ -192,16 +204,8 @@ def main(argv=None, now=None):
             print(f"[OK] Digest succeeded for {now:%Y-%m-%d}: {reason}")
         return 0
 
-    # Compatibility for installations upgrading from filename-only checks.
-    if state == "missing":
-        found = find_todays_digests(now)
-        if found:
-            if not args.quiet:
-                print(
-                    f"[OK] Legacy digest present for {now:%Y-%m-%d}: "
-                    f"{found[0].name} (no current status file)"
-                )
-            return 0
+    # A saved Markdown file may be an offline preview or an unsent draft.
+    # Only the current run's delivery status can establish SMTP submission.
 
     # Nothing yet — but say nothing until the digest is actually overdue,
     # otherwise a morning run would report a failure that has not happened.

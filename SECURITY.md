@@ -8,6 +8,7 @@
 - Treat Reddit content and model output as untrusted. The supported provider adapters disable tools and integrations, use temporary working directories, and exclude SMTP credentials from the child environment. Model prompts alone are not a security boundary.
 - Generated email strips active HTML, images, and non-Reddit links. Source-safe strict mode also blocks delivery when required validation fails. These checks are not a general fact checker or a guarantee against every prompt-injection technique.
 - Saved source data and model drafts can contain third-party personal information. Keep them local, restrict access, and apply appropriate retention/deletion policies. Do not upload them as public bug-report attachments.
+- Local delivery receipts contain content hashes and artifact paths. Keep `.delivery-receipts/`, `*.recovery.json`, release packages, inbox proofs and backups private. A receipt alone never authorizes a resend or proves delivery; the durable ledger remains authoritative for duplicate prevention.
 - Provider authentication remains accessible to the CLI running under your account. Keep the machine, account, dependencies, and CLI installation trusted. This is a local single-user application, not a hardened multi-tenant service.
 - Follow Reddit's current access and data-use requirements. Available RSS/HTML endpoints and request pacing do not establish permission or guarantee complete coverage.
 

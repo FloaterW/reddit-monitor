@@ -20,18 +20,25 @@ def profile(name):
     return resolve_editorial(metadata.get("editorial"), audience=metadata.get("audience"))
 
 
-def test_churning_prompts_are_byte_identical_to_pre_refactor_release():
+def test_churning_style_and_source_rules_preserve_established_newsletter():
     selected = profile("churning")
-    # SHA-256 of the four original prompt literals in release 9abb365.
+    # Style, writing format and safety rules remain unchanged from release 9abb365.
+    # Extraction intentionally changes to protect new offers across issuers.
     fingerprints = {
         "rules": "3d2eabeb1baafe23d110a1a1f4b8ac2308213b265fcb563449651ff17b1356b8",
         "style": "f42303dc5ef083e82913b2f59b8dab4b8d3ac192f4b1dd27a4c7168b278146f9",
-        "extraction": "ef863e5bbc3c344266b3017f65f6333d740fcaacf12e526498f9bf1eb765859b",
         "writing": "c0cfc7d17428749bf6bec8f0be616f0efdb9be36f79a6a8acd1e5299237c82e4",
     }
     for field, expected in fingerprints.items():
-        assert hashlib.sha256(getattr(selected, field).encode()).hexdigest() == expected
+        value = getattr(selected, field)
+        if field == "rules":
+            # Configured topic priorities append to, rather than replace, the
+            # established safety rules. Preserve the original rule text exactly.
+            value = value.split("\nEditorial priorities:\n", 1)[0]
+        assert hashlib.sha256(value.encode()).hexdigest() == expected
     assert selected.financial_checks is True
+    assert "Ink Preferred/CIP" in selected.extraction
+    assert "Preserve useful Bilt rewards" not in selected.extraction
 
 
 @pytest.mark.parametrize("settings", [

@@ -2,6 +2,8 @@
 
 Run commands from the repository root. This reference supplements the [project overview](../README.md) and [editorial profile guide](PROFILES.md). For a service-free first run, use `python demo_digest.py`.
 
+**Configure and test live access first:** Reddit retired RSS support on November 13, 2026. The optional API collector supports an existing working installed-app OAuth client; the legacy adapter cannot be relied on where HTML access is unavailable. Read [collection access and configuration](COLLECTION_ACCESS.md) before running the live examples below. Saved-input preview does not require live Reddit access.
+
 ## Architecture
 
 ```
@@ -30,6 +32,8 @@ Run commands from the repository root. This reference supplements the [project o
 
 **`reddit_scraper.py`** - Standalone scraper. Parses old.reddit.com HTML directly, no API key needed. Supports search, subreddit posts, single-post comments, and deep comment search. Handles rate limiting with retry and backoff.
 
+**`reddit_api.py`** - Optional daily-digest collector. Uses an existing installed OAuth client, reads recent comment listings, enriches thread titles and fetches available parent comments. Tokens remain in memory. API selection does not alter the standalone scraper commands.
+
 **`daily_digest.py`** - Orchestrator. Fetches comments, filters by keyword, summarizes in isolated batches, evaluates and sanitizes the result, writes outputs atomically, and then sends it via Gmail SMTP. It records the complete run, quality, and delivery outcome.
 
 **`monitor_config.py`** - Loads JSON monitor profiles from `config/monitors/`. Validates required fields, applies defaults, and supports the CLI > config > default priority chain.
@@ -38,7 +42,7 @@ Run commands from the repository root. This reference supplements the [project o
 
 **`evaluate_digest.py`** - Standalone and integrated quality checker. It verifies citation coverage and integrity, global numeric consistency, line-level claim grounding, and high-signal comment coverage.
 
-**`run_digest.bat`** - Windows Task Scheduler wrapper. Runs the digest with timestamped output filenames and logs everything to `digest_run.log`. If the run exits non-zero, it calls `notify_failure.py` so the failure reaches your inbox instead of sitting silently in the log.
+**`run_digest.bat`** - Windows Task Scheduler wrapper. Runs `digest_recovery.py` with timestamped output filenames and logs everything to `digest_run.log`. The controller allows one eligible synthesis-timeout resume within the original job deadline. If the final result is non-zero, the wrapper calls `notify_failure.py` so the failure reaches your inbox instead of sitting silently in the log.
 
 **`check_digest_ran.py`** - Independent watchdog. It validates the dated run-status record and the referenced nonempty digest, so a failed email or incomplete write cannot masquerade as success.
 
@@ -107,11 +111,16 @@ python daily_digest.py [OPTIONS]
   --save FILE        Save digest to a specific markdown file
   --save-raw FILE    Also save raw scraped comments to JSON
   --from-json FILE   Resume from saved raw JSON instead of re-scraping
+  --digest-date DATE Edition date YYYY-MM-DD for saved-data recovery
   --subreddits LIST  Override subreddits (comma-separated)
   --keywords LIST    Override keywords (comma-separated)
   --db PATH          Save run history to a SQLite database
-  --no-db            Skip database storage
+  --no-db            Skip run-history storage (email delivery guard remains active)
+  --history-db PATH  Read delivered editorial history without writing it
   --no-email         Disable email delivery for this run
+  --delivery-ledger PATH
+                      Override the durable delivery guard (default: data/delivery.db)
+  --source-safe      Use structured source validation before delivery
   --quality MODE     off | warn | strict (default: warn)
   --evaluation-report FILE
                       Override the JSON quality-report path
@@ -122,6 +131,81 @@ python daily_digest.py [OPTIONS]
 ```
 
 ## Summarization Engine
+
+### Duplicate delivery and uncertain SMTP outcomes
+
+Email-enabled runs hold an operating-system lock for the monitor, edition date, and recipient before changing run artifacts. A durable claim in `data/delivery.db` is committed before SMTP submission, and acceptance is recorded before optional run-history writes. `--no-db` does not disable this protection. `--no-email` does not open or write the delivery ledger. Keep the same ledger for scheduled runs and manual recovery; changing or deleting it can bypass prior delivery records. `DIGEST_DELIVERY_LEDGER` can configure a shared local path.
+
+An already-sent edition exits successfully without regenerating or resending. A concurrent owner exits with code 6. A disconnect or timeout during submission can mean Gmail accepted the message even though the client did not receive confirmation; that edition exits with code 5 and remains blocked. A process crash after claiming also remains blocked. Claims never expire automatically. Explicit SMTP rejection or a failure before submission is retryable. A connection-cleanup failure after confirmed acceptance remains sent.
+
+Before submission, an atomic local receipt stores the artifact paths, hashes and
+bookkeeping information alongside the ledger in `.delivery-receipts/`. It is not
+evidence of acceptance. When the ledger already records `sent`, a later command
+can use a matching receipt to repair missing history and the same edition's
+status without invoking the model or sending mail. It will not overwrite an
+unrelated edition's status. Changed/missing source artifacts prevent history
+reconstruction; duplicate prevention still applies. A history-write failure
+after recorded acceptance is reported as delivered with a bookkeeping warning.
+
+### Bounded timeout recovery
+
+`digest_recovery.py` accepts the daily-digest arguments. It makes at most two
+attempts in total, and only resumes an explicit synthesis `LLMTimeoutError` when
+saved output, hash-pinned source/coverage files and at least two minutes remain.
+The retry keeps the edition, collection-window label, configuration, history,
+analysis context, output paths and successful checkpoints. It never recollects.
+Quota, authentication, quality and SMTP failures do not trigger this retry.
+Both attempts share one absolute synthesis deadline measured 50 minutes from job
+start, including elapsed collection and preprocessing time.
+The workload-based AI allowance is capped per attempt by time still remaining;
+it does not extend that deadline. Final validation, artifact writes, SMTP and
+bookkeeping can add time; this is not a 50-minute process kill timer.
+See [the timing policy](API_ANALYSIS.md).
+`<output>.recovery.json` records attempts and source fingerprints locally.
+
+### Guarded local releases
+
+`scripts/release_control.py --release <private-release-folder> --verify-only`
+checks a pinned payload and unchanged installed baseline without installing it.
+Activation without `--verify-only` additionally requires a specified successful
+scheduled edition, matching sent ledger/status, independent full-message Gmail
+inbox confirmation, an explicit activation window, unchanged task definitions,
+and no active digest/collection process. It also requires a passing, separately
+reviewed real-provider preview with email disabled, matching the exact commit
+and payload. No scheduled task may start within ten minutes. The local manifest is operator-prepared;
+it is not a remote update feed or a self-authenticating inbox check.
+
+The installer preserves a backup, atomically replaces individual files and
+rolls them back if verification fails. It never schedules a job, changes task
+triggers, edits credentials, runs a digest or sends email. Multi-file replacement
+is not a filesystem transaction: use a quiet window between scheduled jobs,
+avoid concurrent manual launches and retain the backup. Initial module imports
+precede the existing workflow locks, so the first installation cannot fully
+exclude a manual-start race. A prepared package is inactive until explicitly invoked after
+the required delivery has been checked. If its window expires or any baseline
+changes, re-review and prepare a new pinned release rather than bypassing checks.
+
+Inspect an uncertain edition before any manual retry:
+
+```powershell
+python manage_delivery.py status --monitor churning --date YYYY-MM-DD
+```
+
+Use the returned Message-ID to check Gmail, for example `in:anywhere rfc822msgid:ID_WITHOUT_ANGLE_BRACKETS`, and inspect the actual message and delivery evidence. If acceptance is confirmed, record it without sending anything:
+
+```powershell
+python manage_delivery.py reconcile --monitor churning --date YYYY-MM-DD --expected-token TOKEN_FROM_STATUS --outcome sent --reason "Confirmed matching message in Gmail"
+```
+
+Use `--outcome retryable` only after independently establishing that the prior submission was not accepted. An empty inbox search alone does not establish rejection. Reconciliation requires the exact attempt token and a reason, refuses an active sender, and records the decision; it never starts a run or sends mail. This is conservative duplicate prevention, not a guarantee of exactly-once inbox delivery. SMTP acceptance and inbox arrival remain separate facts.
+
+For editions sent before the ledger existed, the sender also consults existing sent run history and the newsletter's edition heading. These older records lack recipient information, so a match conservatively blocks sending to the currently configured recipient. Run status now records `edition_date` separately from execution date; a recovered historical edition cannot satisfy today's watchdog.
+
+### Historical factual context
+
+Source-safe generation uses the saved coverage cutoff, or the explicit recovery edition date when no cutoff is available, to assess relative deadlines. It does not substitute the replay execution date. The churning preset rejects selected card identities absent from cited comment/parent bodies and selected claims of received credits supported only by offers or promises. Thread titles without supplied context cannot establish the card. These targeted checks do not verify every semantic claim or establish that a Reddit report is true.
+
+Emailing a saved-data replay requires `--digest-date YYYY-MM-DD` so the subject, heading, status, and duplicate-delivery key identify the same edition. A preview with `--no-email` may omit it: a usable saved cutoff supplies its displayed date; without that reference, the preview uses its execution date while telling the model that the historical cutoff is unknown. Edition labels do not refilter the saved sources.
 
 The digest uses an LLM to summarize scraped comments into a themed digest. The default provider is the signed-in Codex CLI; Claude remains an optional legacy provider. Separate adapters handle each provider's command-line arguments and structured responses.
 
@@ -155,7 +239,7 @@ The digest is emailed automatically after each run. To enable:
 2. **Store it outside the repository and synced folders.** On Windows the default location is `%APPDATA%\reddit-digest\gmail_app_password`. You can instead set `DIGEST_GMAIL_PASSWORD_FILE` to another external path or inject `GMAIL_APP_PASSWORD` into the process environment. For background Task Scheduler runs, set `DIGEST_GMAIL_PASSWORD_FILE` in `.env` to the absolute external path if the task does not expose `APPDATA` or `USERPROFILE`; the path is safe to store there, but the password is not.
 3. Set `DIGEST_EMAIL_TO` and `DIGEST_EMAIL_FROM` in `.env` (see `.env.example`). Do not place the password in `.env`.
 
-If no password is configured, email is explicitly recorded as skipped and the digest is still saved. An attempted SMTP delivery that fails marks the whole run failed and returns a nonzero exit code.
+If no password is configured, email is explicitly recorded as skipped and the digest is still saved, but the delivery run fails with a nonzero exit code. An attempted SMTP delivery that fails also marks the whole run failed. Use `--no-email` for an intentional preview; that mode can complete successfully without delivery and cannot satisfy the delivery watchdog.
 
 Project-local credential files and `GMAIL_APP_PASSWORD` entries in `.env` are deliberately ignored. This prevents an ignored file in a cloned or synced working tree from becoming the active secret source.
 
@@ -220,6 +304,9 @@ $action = New-ScheduledTaskAction `
     -Argument '/c "path\to\run_digest.bat"'
 
 $trigger = New-ScheduledTaskTrigger -Daily -At "6:30PM"
+# Keep a local wall-clock time across daylight-saving changes.
+# An explicit UTC offset fixes the UTC time instead and shifts the local hour.
+$trigger.StartBoundary = (Get-Date -Hour 18 -Minute 30 -Second 0).ToString("yyyy-MM-dd'T'HH:mm:ss")
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -239,7 +326,22 @@ Register-ScheduledTask `
 Start-ScheduledTask -TaskName "RedditDailyDigest"
 ```
 
-The batch wrapper prefers `.venv`, rotates `digest_run.log` at 5 MiB, keeps full digest text out of the log, and writes `data/last_run_status.json`. Schedule `run_watchdog.bat` separately after the expected completion time; it alerts if the run did not finish successfully, email failed or was skipped, the quality gate blocked delivery, or the digest is missing/empty.
+The batch wrapper prefers `.venv`, rotates `digest_run.log` at 5 MiB, keeps full digest text out of the log, and writes `data/last_run_status.json`. Schedule `run_watchdog.bat` separately at 7:30 p.m. local time, using the same offset-free `StartBoundary` pattern with hour 19. It alerts if the run did not finish successfully, email failed or was skipped, the quality gate blocked delivery, or the digest is missing/empty. A Markdown file alone is not evidence of a sent newsletter; the watchdog requires a current successful status with `email_status: sent`.
+
+The computer's time zone must match the intended delivery zone (for Toronto, Windows uses `Eastern Standard Time` with automatic daylight-saving adjustment). Verify both tasks' `NextRunTime` after setup and timezone changes. Microsoft documents that an [offset-free StartBoundary follows the computer's timezone and daylight-saving rules](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itrigger-put_startboundary); a boundary ending in `Z` or `-05:00` does not. Export existing task XML before changing a trigger, and preserve its actions, principal and settings.
+
+For the existing root tasks `RedditDailyDigest` and `RedditDigestWatchdog`, the guarded repair script first checks their wrappers, working directory, daily triggers, idle state, and timezone:
+
+```powershell
+# Read-only plan
+powershell -NoProfile -File scripts/repair_digest_schedule.ps1
+# Apply from an administrator PowerShell session
+powershell -NoProfile -File scripts/repair_digest_schedule.ps1 -Apply -ReportPath data/schedule-repair-result.json
+```
+
+It backs up both task definitions under `data/schedule-repair/`, changes only their start boundaries to local 18:30 and 19:30, and verifies the definitions and next-run times. A failure attempts to restore changed boundaries and records any rollback requiring review. It does not launch a digest; already-correct tasks are left alone.
+
+Live daily collection reads the prior successfully sent edition's coverage sidecar before replacing its status. When that boundary is between 24 and 25 hours old, the next collection starts there to attempt to bridge a schedule shift or short delay. Existing page, request, and time budgets remain unchanged, so this does not guarantee recovery. Larger gaps retain the normal 24-hour window and disclose the uncollected interval. Unusable prior boundaries are not invented. Saved-data replay does not extend or recollect the original window.
 
 ## Standalone Scraper Usage
 
@@ -264,7 +366,9 @@ python reddit_scraper.py deep-search "FastAPI" --subreddit python,webdev --posts
 
 ## How the Scraper Works
 
-The scraper first tries old.reddit.com HTML and falls back to Reddit's RSS feeds when login is required. No API key, OAuth, or PRAW is needed.
+Daily digests select `DIGEST_REDDIT_SOURCE=api` or `legacy` from local configuration. API mode requires `REDDIT_CLIENT_ID` and `REDDIT_API_USER_AGENT`, uses application-only installed-client OAuth, and never silently falls back to retired feeds. It retains a shared request pace and a 300-second budget per community, reads at most 30 comment pages, and retrieves parent context in bounded batches. Post-count and post-sort options do not restrict recent-comment API listings. See [collection access](COLLECTION_ACCESS.md) for configuration and preview commands.
+
+The following describes the legacy HTML/RSS adapter. It first tries old.reddit.com HTML and falls back to RSS when login is required. RSS is retired and cannot be treated as a reliable production fallback.
 
 - **Post parsing** - extracts `data-*` attributes from `<div>` elements with `data-type="link"` (score, author, timestamp, permalink)
 - **Comment parsing** - a structured `HTMLParser` walk extracts complete bodies, score, timestamps, nesting depth, and parent IDs
@@ -283,16 +387,18 @@ Each run produces:
 - **`digest_YYYYMMDD_HHMM.md`** - the digest in Markdown
 - **`digest_YYYYMMDD_HHMM.json`** - raw scraped comments with metadata (when `--save-raw` is used)
 - **`digest_YYYYMMDD_HHMM.coverage.json`** - collection warnings, window and counts, preserved for saved-data replay
+- **`digest_YYYYMMDD_HHMM.collection-audit.json`** - bounded filtering decisions, body/title/parent keyword origins and rejected excerpts when `--save-raw` is used; exact aggregate counts include omitted audit records
 - **`digest_YYYYMMDD_HHMM.evaluation.json`** - deterministic quality results
 - **`digest_YYYYMMDD_HHMM.work/`** - local-only structured model drafts for diagnosing validation failures (excluded from Git)
 - **`data/last_run_status.json`** - atomic machine-readable run, quality, and email outcome
+- **`data/delivery.db`** - durable SMTP submission guard; excluded from Git and independent of optional run history
 - **`digest_run.log`** - scheduled-run output, rotated to `digest_run.previous.log` at 5 MiB
 
 ## Testing
 
 ```bash
-# Install dev dependencies
-python -m pip install -r requirements-dev-lock.txt
+# Install tests and lint (Python 3.10+)
+python -m pip install -r requirements-test-lock.txt
 
 # Run tests
 python -m pytest -q
@@ -305,6 +411,10 @@ python -m ruff check .
 ```
 
 Tests cover parsing, matching, RSS selection, retries, LLM isolation, email outcomes, atomic run lifecycle, watchdog behavior, configuration, transactional SQLite storage, and digest evaluation. Tests use static fixtures and mocks rather than live network calls. CI runs on Linux and Windows with Python 3.10 and 3.12, audits dependencies, and enforces the coverage floor. CodeQL scans the default branch and pull requests.
+
+Collection audits are local diagnostic data and are ignored by Git. Detailed records are capped at 5,000 per run, with rejected-body excerpts of at most 600 characters; truncation is disclosed. They observe filtering after the collector's upstream title filtering and deduplication. They cannot reconstruct unfetched Reddit content or earlier unrecorded exclusions. A replay copied with `--save-raw` creates a clearly labeled replay manifest, preserving the original files; it does not invent historical filtering decisions. Audits may include public source text and should be treated with the same care as raw comment archives.
+
+For dependency security auditing, use Python 3.11+ and install `requirements-dev-lock.txt`, then run `python -m pip_audit -r requirements-dev-lock.txt`. This includes the test lock and the pinned audit tools. The patched `filelock` used by the auditing tool requires Python 3.11; it is not a runtime dependency of the digest. Runtime and test-only installs continue to support Python 3.10. Regenerate the corresponding locks after changing `requirements.txt`, `requirements-test.txt`, or `requirements-dev.txt`.
 
 ## Project Structure
 
@@ -323,9 +433,11 @@ reddit-digest/
 ├── check_digest_ran.py         # Independent successful-run watchdog
 ├── run_watchdog.bat            # Windows wrapper for the watchdog
 ├── requirements.txt            # Python dependencies
-├── requirements-dev.txt        # Dev dependencies (pytest, ruff)
+├── requirements-test.txt       # Test/lint dependencies (Python 3.10+)
+├── requirements-dev.txt        # Test/lint + auditing dependencies (Python 3.11+)
 ├── requirements-lock.txt       # Reproducible resolved runtime versions
-├── requirements-dev-lock.txt   # Reproducible resolved CI/dev versions
+├── requirements-test-lock.txt  # Reproducible test/lint versions (Python 3.10+)
+├── requirements-dev-lock.txt   # Reproducible full dev/audit versions (Python 3.11+)
 ├── pyproject.toml              # Project config (pytest, ruff settings)
 ├── example_digest.md           # Sample digest output
 ├── .env.example                # Environment variable template
@@ -339,7 +451,7 @@ reddit-digest/
 
 ## Design Tradeoffs / Limitations
 
-**Why HTML/RSS scraping instead of the Reddit API?** This implementation currently parses old.reddit.com HTML and uses RSS as a fallback. The tradeoff is **markup/feed fragility and reduced RSS metadata**: Reddit changes may require parser updates, and RSS comments commonly report a score of zero. Technical access does not establish permission to collect or reuse data. Review Reddit's current access policies before operating or expanding collection; the project does not supply approved API access or guarantee permission.
+**Collector choice.** Existing approved installed-app access can use the OAuth API collector. The opt-in [API analysis path](API_ANALYSIS.md) adds standalone posts, a refreshed collection cache, a collection-only midday command and local reports. Legacy HTML/RSS code remains for compatibility; it does not guarantee working access. Technical access does not establish permission to collect or reuse data. The project does not supply approved API access.
 
 **Rate limiting.** HTML requests retain their existing delays. RSS starts with a shared minimum request interval and increases it after HTTP 429, honoring numeric or HTTP-date Retry-After values. A cooldown beyond the collection budget stops that feed and retains already-collected data. Time/page limits and inaccessible feeds mean completeness cannot be guaranteed; a successful email can have `completed_with_warnings` status.
 

@@ -35,10 +35,10 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements-lock.txt
-            requirements-dev-lock.txt
+            requirements-test-lock.txt
 
       - name: Install dependencies
-        run: python -m pip install -r requirements-dev-lock.txt
+        run: python -m pip install -r requirements-test-lock.txt
 
       - name: Verify dependency consistency
         run: python -m pip check
@@ -53,6 +53,7 @@ jobs:
         run: >-
           python -m pytest -q
           --cov=reddit_scraper
+          --cov=reddit_api
           --cov=daily_digest
           --cov=monitor_config
           --cov=storage
@@ -60,7 +61,29 @@ jobs:
           --cov=check_digest_ran
           --cov=notify_failure
           --cov=verified_digest
+          --cov=synthesis_budget
+          --cov=digest_recovery
+          --cov=delivery_recovery
+          --cov=editorial_novelty
           --cov=editorial_profiles
+          --cov=editorial_selection
+          --cov=published_story_memory
+          --cov=factual_checks
+          --cov=delivery_guard
+          --cov=manage_delivery
+          --cov=coverage_continuity
+          --cov=collection_audit
+          --cov=editorial_retention
+          --cov=editorial_trace
+          --cov=omission_review
+          --cov=topic_attribution
+          --cov=source_records
+          --cov=offer_facts
+          --cov=intelligence_store
+          --cov=enhanced_collection
+          --cov=analysis_batches
+          --cov=analysis_report
+          --cov=collect_snapshot
           --cov=demo_digest
           --cov-report=term
           --cov-fail-under=60
@@ -77,10 +100,19 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements-lock.txt
+          cache-dependency-path: |
+            requirements-lock.txt
+            requirements-test-lock.txt
+            requirements-dev-lock.txt
 
-      - name: Install audit tool
-        run: python -m pip install "pip-audit>=2.9,<3"
+      - name: Install locked audit environment
+        run: python -m pip install -r requirements-dev-lock.txt
 
-      - name: Audit locked dependencies
+      - name: Audit locked runtime dependencies
+        run: python -m pip_audit -r requirements-lock.txt
+
+      - name: Audit locked test dependencies
+        run: python -m pip_audit -r requirements-test-lock.txt
+
+      - name: Audit locked development dependencies
         run: python -m pip_audit -r requirements-dev-lock.txt

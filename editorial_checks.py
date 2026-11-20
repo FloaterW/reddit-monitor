@@ -31,7 +31,7 @@ def editorial_issues(text, *, leading_source=False, source_bodies=None):
     plain = _plain(text).strip()
     issues = []
     # Preserve noun phrases such as 'Reports of ...' and ordinary imperatives.
-    if (not leading_source and re.match(r"^(?:reports|notes|confirms|asks)\b", plain, re.I)
+    if (not leading_source and re.match(r"^(?:reports|notes|confirms|asks|says)\b", plain, re.I)
             and not re.match(r"^(?:reports|notes)\s+(?:of|on|from|about)\b", plain, re.I)):
         issues.append("End-cited bullet lacks a grammatical subject. Write a complete sentence, or use one leading source with source_position=start; do not just move the citations.")
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 CHURNING_AUDIENCE = "credit card churning and award travel enthusiasts"
 
-# Preserve the established churning prompts verbatim, including whitespace.
+# Preserve the established newsletter's style while improving news selection.
 CHURNING_STYLE = """
 Match the established newsletter, not an audit report. The application supplies
 the date heading and horizontal rules: never create a date-only section or add
@@ -71,8 +71,24 @@ CHURNING_EXTRACTION = """
 Extract up to 15 useful notes. Return JSON only:
 {"notes":[{"topic":"theme","text":"useful fact with caveats",
 "source_ids":["t1_actual_id"]}]}. Each note must be under 70 words. Use an empty
-notes list if there is no substantive information. Preserve useful Bilt rewards
-information as well as other issuers/programs when present.
+notes list if there is no substantive information. Lead with changed welcome
+offers, deadlines and concrete approval/denial experiences across all issuers.
+Preserve specific Ink Cash/CIC, Ink Unlimited/CIU, Ink Preferred/CIP and Sapphire
+Reserve for Business/CSRB offer leads, even when phrased as a question; keep them
+unverified. 'Already approved' marketing is not an actual approval or bonus payout.
+Distinguish public, targeted, referral and in-app offers. Never fill missing terms
+from memory. Flag conflicting spending periods and refer to the actual offer terms.
+Consolidate repeated Bilt explanations while preserving substantive new Bilt news.
+Keep benefit-qualifying spend with the benefit it unlocks. Preserve contrasting
+successful and blocked outcomes, including native versus converted products;
+do not retain only the negative half of a useful comparison. Keep firsthand
+cashback/points/miles conversion outcomes and concrete payment or account
+restrictions when useful. Separate an operational data point from general advice.
+Preserve explicit event age such as 'a couple of weeks ago'; a newly posted
+comment can describe an older offer. Do not promote old sightings as new launches.
+Use recent editions to distinguish the same author's repeated terms from new
+facts. Retain material changes and useful contradictions, not repeated explainers.
+Keep qualifying conditions and uncertain deadlines precise in topic headings too.
 SOURCE COMMENTS:
 """
 

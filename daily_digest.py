@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -63,13 +64,15 @@ POST_TITLE_FILTERS = {
 KEYWORDS = [
     "chase", "amex", "citi", "capital one",
     "sapphire", "ink",
-    "CIP", "CIC", "CSR", "CSP", "CIU",
+    "CIP", "CIC", "CSR", "CSRB", "CSP", "CIU",
     "c1", "vx", "bonvoy",
     "SUB", "bonus", "retention",
     "paze", "bilt", "palladium",
     "hyatt", "hilton", "marriott",
     "boa", "alaska", "summit",
     "5/24",
+    "manufactured spend", "MS", "buying group", "buying groups", "BFMR",
+    "Buy For Me Retail", "Amazon", "Prime", "Best Buy",
 ]
 
 POSTS_PER_SUB = 10
@@ -96,7 +99,7 @@ try:
 except ValueError:
     PROMPT_BODY_LIMIT = 4_000
 
-# Email — leave GMAIL_APP_PASSWORD empty to skip emailing.
+# Use --no-email for previews; missing SMTP credentials fail a delivery run.
 EMAIL_TO = os.getenv("DIGEST_EMAIL_TO", "your_email@gmail.com")
 EMAIL_FROM = os.getenv("DIGEST_EMAIL_FROM", "your_email@gmail.com")
 
@@ -156,6 +159,8 @@ GMAIL_APP_PASSWORD, GMAIL_PASSWORD_SOURCE = _load_gmail_password()
 
 PROJECT_DIR = Path(__file__).parent
 DEFAULT_STATUS_FILE = PROJECT_DIR / "data" / "last_run_status.json"
+DEFAULT_DELIVERY_LEDGER = PROJECT_DIR / "data" / "delivery.db"
+DEFAULT_HISTORY_DB = PROJECT_DIR / "data" / "monitor.db"
 
 
 def atomic_write_text(path, text):
@@ -191,12 +196,13 @@ def atomic_write_json(path, payload):
 def write_run_status(path, *, started_at, status, exit_code, monitor_name,
                      digest_path=None, raw_json_path=None, email_status=None,
                      quality_status=None, evaluation_path=None, error=None,
-                     collection_warnings=None):
+                     collection_warnings=None, edition_date=None):
     """Publish the final run outcome consumed by the watchdog."""
     completed_at = datetime.now(timezone.utc)
     payload = {
         "version": 1,
         "date": datetime.now().astimezone().date().isoformat(),
+        "edition_date": edition_date or started_at.astimezone().date().isoformat(),
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
         "status": status,
@@ -229,7 +235,7 @@ from reddit_scraper import (
 
 
 def _fetch_all_comments_rss(subreddits, posts_per_sub, post_sort, time_filter,
-                            title_filters, window_end=None):
+                            title_filters, window_end=None, window_start=None):
     """Fetch comments via RSS when old.reddit.com is inaccessible."""
     all_comments = []
     window_end = window_end or datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -237,7 +243,7 @@ def _fetch_all_comments_rss(subreddits, posts_per_sub, post_sort, time_filter,
     for sub in subreddits:
         print(f"\n  Fetching r/{sub} comments via RSS...")
 
-        cutoff = None if time_filter == "all" else (
+        cutoff = None if time_filter == "all" else window_start or (
             window_end - timedelta(hours=TIME_WINDOW_HOURS.get(time_filter, 24))
         )
         comments = fetch_subreddit_comments_rss(sub, cutoff=cutoff)
@@ -260,26 +266,58 @@ def _fetch_all_comments_rss(subreddits, posts_per_sub, post_sort, time_filter,
 
 
 def _fetch_all_comments(subreddits, posts_per_sub, post_sort, time_filter,
-                        title_filters=None, window_end=None):
+                        title_filters=None, window_end=None, window_start=None):
     """Give each subreddit a fair, bounded share of collection time."""
     comments = []
     window_end = window_end or datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    source = _collection_source()
+    if source == "api":
+        from reddit_api import RedditAPIClient
+
+        cutoff = None if time_filter == "all" else window_start or (
+            window_end - timedelta(hours=TIME_WINDOW_HOURS.get(time_filter, 24))
+        )
+        filters = POST_TITLE_FILTERS if title_filters is None else title_filters
+        with RedditAPIClient.from_environment() as client:
+            for sub in subreddits:
+                print(f"\n  Fetching r/{sub} comments via Reddit API...")
+                collection_warning(sub, "API source scope: standalone post bodies are not collected.")
+                with request_budget(300):
+                    comments.extend(client.fetch_subreddit(
+                        sub, cutoff=cutoff, window_end=window_end,
+                        title_filter=filters.get(sub),
+                    ))
+        return comments
+    html_available = old_reddit_available() if subreddits else False
     for sub in subreddits:
         with request_budget(300):
             comments.extend(_fetch_all_comments_unbudgeted(
                 [sub], posts_per_sub, post_sort, time_filter, title_filters, window_end=window_end,
+                window_start=window_start,
+                html_available=html_available,
             ))
     return comments
 
 
+def _collection_source():
+    """Choose explicitly; a failed API request must not silently use retired RSS."""
+    source = os.getenv("DIGEST_REDDIT_SOURCE", "legacy").strip().lower()
+    if source not in {"legacy", "api"}:
+        raise ValueError("DIGEST_REDDIT_SOURCE must be 'legacy' or 'api'")
+    return source
+
+
 def _fetch_all_comments_unbudgeted(subreddits, posts_per_sub, post_sort, time_filter,
-                                  title_filters=None, window_end=None):
+                                  title_filters=None, window_end=None, window_start=None,
+                                  html_available=None):
     """Fetch comments from recent posts across subreddits (one pass)."""
     if title_filters is None:
         title_filters = POST_TITLE_FILTERS
 
-    if not old_reddit_available():
-        print("\n  old.reddit.com requires login — using RSS feeds.")
+    if html_available is None:
+        html_available = old_reddit_available()
+    if not html_available:
+        print("\n  old.reddit.com HTML collection unavailable — trying RSS feeds.")
         print("  WARNING: RSS supplies thread titles but no parent IDs; reply context is limited.")
         return _fetch_all_comments_rss(
             subreddits,
@@ -288,6 +326,7 @@ def _fetch_all_comments_unbudgeted(subreddits, posts_per_sub, post_sort, time_fi
             time_filter,
             title_filters,
             window_end=window_end,
+            window_start=window_start,
         )
 
     all_comments = []
@@ -399,11 +438,45 @@ def collection_notice(warnings, *, replay_unknown=False):
         notes.append("Collection limits or unavailable pages may have left gaps")
     if "RSS parent" in reasons:
         notes.append("RSS covers recent comments, not all standalone post bodies, and does not provide parent replies")
+    if "API source scope:" in reasons:
+        notes.append("API collection covers bounded submission and comment listings with available parent context"
+                     if "bounded submission and comment listings" in reasons else
+                     "API collection covers recent comments and available parent replies; standalone post bodies are not collected")
+    if "API cache refresh incomplete:" in reasons:
+        notes.append("Some cached sources could not be refreshed and were excluded")
+    if "API cache unavailable:" in reasons:
+        notes.append("The local cache was unavailable; collection used a fresh full window")
+    if "API parent context" in reasons:
+        notes.append("Some parent replies could not be retrieved, so reply context may be incomplete")
+    if "API request failed:" in reasons:
+        notes.append("Some Reddit API requests failed, leaving collection gaps")
+    notes.extend(w["reason"] for w in warnings if w.get("subreddit") == "" and
+                 w.get("reason", "").startswith(("Coverage continuity gap:", "Daily collection window",
+                                                  "Previous delivered coverage boundary")))
     if not notes:
         notes.append("Collection completeness could not be confirmed")
+    notes = [note.strip().rstrip(". ") for note in notes]
     scope = ", ".join("r/" + s for s in subs)
     return "\n\n---\n\n**Coverage note:** " + ". ".join(notes) + (
         f". Affected feeds: {scope}." if scope else ".") + " This digest is not exhaustive.\n"
+
+
+def _empty_collection_error(stats, *, replay=False):
+    """Distinguish missing input and failed collection from keyword filtering."""
+    if replay:
+        return "Saved input contains no comments; no digest can be recovered from this file."
+    count = stats.get("raw_comment_count", 0)
+    if count:
+        return (f"Collected {count} comments, but none matched the configured time window "
+                "and keywords; no digest was produced.")
+    warnings = stats.get("collection_warnings", [])
+    details = list(dict.fromkeys(
+        w["reason"] for w in warnings if w.get("reason", "").startswith(("RSS request failed:", "API request failed:"))
+    ))
+    if details or warnings:
+        reason = " ".join(details[:3]) or "See the collection warnings in the coverage sidecar."
+        return f"Reddit collection failed: no comments were retrieved. {reason} No digest was produced."
+    return "No comments were collected; no digest was produced."
 
 
 def _comment_in_window(created_str, cutoff_dt, end_dt=None):
@@ -418,28 +491,65 @@ def _comment_in_window(created_str, cutoff_dt, end_dt=None):
 
 
 def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
-               post_sort=None, title_filters=None, stats=None, window_end=None):
+               post_sort=None, title_filters=None, stats=None, window_end=None, window_start=None,
+               collection_audit=None, raw_sources=None, raw_warnings=()):
     """Fetch all comments once, then filter for any matching keyword."""
     # Source timestamps have minute precision. Freeze the window before network
     # work, so a slow scrape neither drops early comments nor admits later news.
     window_end = (window_end or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
+    if window_start is not None:
+        if (time_filter != "day" or window_start.tzinfo is None
+                or not 24 <= (window_end - window_start).total_seconds() / 3600 <= 25):
+            raise ValueError("A daily continuity window must be timezone-aware and between 24 and 25 hours")
+        window_start = window_start.astimezone(timezone.utc).replace(second=0, microsecond=0)
     with collection_diagnostics() as warnings:
-        raw = _fetch_all_comments(subreddits, posts_per_sub,
-                                  post_sort or POST_SORT, time_filter,
-                                  title_filters=title_filters, window_end=window_end)
+        if raw_sources is None:
+            raw = _fetch_all_comments(subreddits, posts_per_sub,
+                                      post_sort or POST_SORT, time_filter,
+                                      title_filters=title_filters, window_end=window_end,
+                                      window_start=window_start)
+        else:
+            raw = list(raw_sources)
+            warnings.extend(raw_warnings)
     if stats is not None and warnings:
         stats["collection_warnings"] = warnings
     print(f"\n  Total comments fetched: {len(raw)}")
     if stats is not None:
         stats["raw_comment_count"] = len(raw)
+        stats["collector"] = _collection_source()
+
+    audit_decisions = {}
+
+    def record_decision(index, source, retained, reason, hits=(), parents=()):
+        if collection_audit is None:
+            return
+        origins = {
+            "body": [kw for kw in hits if _matches_query(kw.lower(), source.get("body", ""))],
+            "title": [kw for kw in hits if _matches_query(kw.lower(), source.get("post_title", ""))],
+            "parent": [kw for kw in hits if any(_matches_query(kw.lower(), p.get("body", "")) for p in parents)],
+        }
+        audit_decisions[index] = {"retained": retained, "reason": reason, "keyword_matches": origins}
 
     if time_filter == "all":
         recent = raw
+        recent_positions = list(enumerate(raw))
+        cutoff = None
         print("  Time filter: all (no timestamp cutoff)")
     else:
         hours = TIME_WINDOW_HOURS.get(time_filter, 24)
-        cutoff = window_end - timedelta(hours=hours)
-        recent = [c for c in raw if _comment_in_window(c.get("created", ""), cutoff, window_end)]
+        cutoff = window_start or window_end - timedelta(hours=hours)
+        recent_positions = []
+        for index, comment in enumerate(raw):
+            if _comment_in_window(comment.get("created", ""), cutoff, window_end):
+                recent_positions.append((index, comment))
+            elif collection_audit is not None:
+                try:
+                    datetime.strptime(comment.get("created", ""), "%Y-%m-%d %H:%M UTC")
+                    reason = "outside_window"
+                except (TypeError, ValueError):
+                    reason = "undated"
+                record_decision(index, comment, False, reason)
+        recent = [comment for _, comment in recent_positions]
         print(f"  Fixed window: {cutoff.isoformat()} to {window_end.isoformat()}")
         print(f"  Comments in window: {len(recent)} (excluded {len(raw) - len(recent)} outside window or undated)")
         if stats is not None:
@@ -448,6 +558,7 @@ def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
     matched = []
     seen = set()
     by_id = {c["id"]: c for c in raw if c.get("id")}
+    index_by_id = {c["id"]: index for index, c in enumerate(raw) if c.get("id")}
 
     def ancestors(comment):
         parents = []
@@ -462,7 +573,13 @@ def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
             parent_id = parent.get("parent_id")
         return list(reversed(parents))
 
-    for c in recent:
+    for index, c in recent_positions:
+        # Deleted placeholders may inherit a matching title or ancestor, but
+        # cannot turn that background material into a current news source.
+        # Keep them in by_id so a real reply can still traverse its ancestry.
+        if c.get("content_removed") or c.get("body", "").strip().casefold() in {"[removed]", "[deleted]"}:
+            record_decision(index, c, False, "unavailable_body")
+            continue
         parents = ancestors(c)
         texts = [c.get("body", ""), c.get("post_title", "")]
         texts.extend(p.get("body", "") for p in parents)
@@ -476,6 +593,11 @@ def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
                     else "top_level" if c.get("parent_id", "").startswith("t3_") else "unknown")
                 matched.append({**c, "matched_keywords": hits, "parent_context": parents,
                                 "context_status": context_status})
+                record_decision(index, c, True, "keyword_match", hits, parents)
+            else:
+                record_decision(index, c, False, "duplicate", hits, parents)
+        else:
+            record_decision(index, c, False, "no_keyword")
 
     # Retain source records for citation validation, even if an ancestor is older
     # than the current window. These records are explicitly background only.
@@ -486,7 +608,17 @@ def scrape_all(keywords, subreddits, posts_per_sub, time_filter,
             if key not in seen:
                 seen.add(key)
                 context.append({**parent, "matched_keywords": [], "context_only": True})
+                record_decision(index_by_id[parent["id"]], parent, True, "background_context")
     matched.extend(context)
+
+    if collection_audit is not None:
+        from collection_audit import build_collection_audit
+        collection_audit.update(build_collection_audit(
+            raw, audit_decisions,
+            window_start=cutoff.isoformat() if cutoff else None,
+            window_end=window_end.isoformat() if cutoff else None,
+            warnings=warnings,
+        ))
 
     print(f"  Comments matching keywords: {len(matched)}")
     if stats is not None:
@@ -781,6 +913,35 @@ class LLMTimeoutError(RuntimeError, TimeoutError):
     """A transient provider timeout, distinct from auth and validation errors."""
 
 
+class LLMTransientError(RuntimeError, ConnectionError):
+    """A provider transport/session failure eligible for one bounded fresh call."""
+
+
+def _codex_error_detail(stdout):
+    """Put the terminal cause ahead of startup warnings and reconnect chatter."""
+    last_error = ""
+    terminal_error = ""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "turn.failed":
+            error = event.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                terminal_error = error["message"]
+        elif event.get("type") == "error" and isinstance(event.get("message"), str):
+            last_error = event["message"]
+    return terminal_error or last_error or stdout
+
+
+def _redact_provider_error(text):
+    text = re.sub(r"\bsk-[A-Za-z0-9_*\-]+", "[redacted key]", text)
+    return re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]+", "Bearer [redacted]", text)
+
+
 def _invoke_llm(prompt_text, timeout=None, structured=False):
     cmd = _build_llm_command()
     schema = None
@@ -826,7 +987,9 @@ def _invoke_llm(prompt_text, timeout=None, structured=False):
         # Keep the actual error/reset time ahead of verbose usage metadata so
         # truncating the saved run status cannot hide the failure's cause.
         stdout_detail = stdout
-        if provider == "claude":
+        if provider == "codex":
+            stdout_detail = _codex_error_detail(stdout)
+        elif provider == "claude":
             try:
                 failure = json.loads(stdout)
                 if isinstance(failure, dict) and isinstance(failure.get("result"), str):
@@ -834,7 +997,7 @@ def _invoke_llm(prompt_text, timeout=None, structured=False):
             except ValueError:
                 pass
         details = "\n".join(
-            f"  {label}: {text}"
+            f"  {label}: {_redact_provider_error(text)}"
             for label, text in (("stdout", stdout_detail), ("stderr", stderr))
             if text
         )
@@ -843,19 +1006,34 @@ def _invoke_llm(prompt_text, timeout=None, structured=False):
             f"  Command: {Path(cmd[0]).name} [isolated]\n"
             f"{details or '  (no output captured)'}"
         )
-        failure_text = f"{stderr}\n{stdout}".lower()
-        if any(term in failure_text for term in ("session limit", "usage limit", "quota", "rate limit")):
+        failure_text = f"{stderr}\n{stdout_detail}".lower()
+        quota_error = any(term in failure_text for term in ("session limit", "usage limit", "quota", "rate limit"))
+        permanent_auth = any(term in failure_text for term in (
+            "refresh token", "refresh_token", "please log in", "not logged in",
+            "login required", "sign in again",
+        ))
+        # A fresh CLI process rereads the shared ChatGPT login cache. Permit
+        # one retry for a rejected session or broken transport, never a quota
+        # bypass, an interactive login, or an unbounded authentication loop.
+        retryable = provider == "codex" and not (quota_error or permanent_auth) and (
+            bool(re.search(r"\b(?:unexpected status|http)\s+(?:401|500|502|503|504)\b", failure_text))
+            or any(term in failure_text for term in (
+                "stream disconnected before completion", "connection reset", "connection timed out",
+            ))
+        )
+        if quota_error:
             message += "\n  The AI service allowance is unavailable. Wait for its stated reset before retrying; no raw-comment fallback will be sent."
-        elif "authenticat" in failure_text:
-            message += (
-                f"\n  Re-authenticate with '{LLM_COMMAND}' interactively, then rerun."
-            )
+        elif permanent_auth or any(term in failure_text for term in ("authenticat", "unauthorized", "incorrect api key")):
+            if provider == "codex":
+                message += f"\n  If this persists, check '{LLM_COMMAND} login status' and sign in again interactively."
+            else:
+                message += f"\n  Re-authenticate with '{LLM_COMMAND}' interactively, then rerun."
         else:
             message += (
                 f"\n  Check that '{LLM_COMMAND}' is installed and "
                 "its configured model is available."
             )
-        raise RuntimeError(message)
+        raise (LLMTransientError if retryable else RuntimeError)(message)
 
     output = result.stdout.strip()
     if schema and provider == "claude":
@@ -910,12 +1088,25 @@ def _chunk_comments(comments):
 
 def summarize(comments, time_window="24 hours", audience=None,
               monitor_name=None, description=None, subreddits=None, source_safe=False,
-              artifact_dir=None, editorial_profile=None):
+              artifact_dir=None, editorial_profile=None, recent_editions=None, editorial_report=None,
+              edition_cutoff=None, analysis_context=None, available_ai_seconds=None, job_deadline=None):
     if source_safe:
+        if analysis_context:
+            from analysis_batches import chunk_sources
+            chunker = chunk_sources
+        else:
+            chunker = _chunk_comments
         from verified_digest import summarize_verified
         print(f"  LLM command: {Path(LLM_COMMAND).name}, tools: disabled")
-        return summarize_verified(comments, _chunk_comments, _invoke_llm, artifact_dir=artifact_dir,
-                                  editorial_profile=editorial_profile or resolve_editorial(audience=audience))
+        extra = {"analysis_context": analysis_context} if analysis_context else {}
+        if available_ai_seconds is not None:
+            extra["available_ai_seconds"] = available_ai_seconds
+        if job_deadline is not None:
+            extra["job_deadline"] = job_deadline
+        return summarize_verified(comments, chunker, _invoke_llm, artifact_dir=artifact_dir,
+                                  editorial_profile=editorial_profile or resolve_editorial(audience=audience),
+                                  recent_editions=recent_editions, editorial_report=editorial_report,
+                                  edition_cutoff=edition_cutoff, **extra)
     focus_parts = [p for p in (monitor_name, description) if p]
     focus_line = f"\nMonitor focus: {' — '.join(focus_parts)}" if focus_parts else ""
 
@@ -1111,8 +1302,8 @@ def _markdown_to_safe_html(md_text):
     return linker.linkify(cleaned)
 
 
-def send_email(subject, body_md, subreddits=None):
-    """Send the digest as HTML email and return sent, skipped, or failed."""
+def send_email(subject, body_md, subreddits=None, *, message_id=None):
+    """Submit once; distinguish rejection from an ambiguous SMTP outcome."""
     if not GMAIL_APP_PASSWORD:
         print("[SKIP] No Gmail app password configured — email not sent.")
         return "skipped"
@@ -1120,29 +1311,79 @@ def send_email(subject, body_md, subreddits=None):
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
-    body_md = sanitize_digest_markdown(body_md)
-    inner = _markdown_to_safe_html(body_md)
-    inner = _inline_styles(inner)
-    html_body = _wrap_html_email(inner, subject, subreddits=subreddits)
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg.attach(MIMEText(body_md, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
+    submitting = accepted = False
     try:
+        body_md = sanitize_digest_markdown(body_md)
+        inner = _markdown_to_safe_html(body_md)
+        inner = _inline_styles(inner)
+        html_body = _wrap_html_email(inner, subject, subreddits=subreddits)
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        if message_id:
+            msg["Message-ID"] = message_id
+        msg.attach(MIMEText(body_md, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        serialized_message = msg.as_string()
         with smtplib.SMTP_SSL(
             "smtp.gmail.com", 465, timeout=30, context=ssl.create_default_context()
         ) as server:
             server.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
-            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+            submitting = True
+            server.sendmail(EMAIL_FROM, EMAIL_TO, serialized_message)
+            accepted = True
         print(f"[OK] Digest emailed to {EMAIL_TO}")
         return "sent"
     except Exception as e:
+        if accepted:
+            print("[WARN] SMTP accepted the digest, but connection cleanup failed; do not resend.")
+            return "sent"
+        rejected = isinstance(e, (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused)) or (
+            isinstance(e, smtplib.SMTPDataError) and 400 <= e.smtp_code < 600
+        )
+        if submitting and not rejected:
+            print("[ERROR] SMTP submission outcome is uncertain; automatic resend is blocked.")
+            return "uncertain"
         print(f"[ERROR] Email failed: {e}")
         return "failed"
+
+
+def _previously_sent_edition(paths, monitor_name, edition_date):
+    """Read legacy sent history conservatively; old records lack recipients.
+
+    Prefer the actual newsletter heading to a delivery timestamp so a recovered
+    historical edition cannot be confused with the day it was sent.
+    """
+    seen = set()
+    for value in paths:
+        if not value:
+            continue
+        path = Path(value).resolve()
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        try:
+            tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"runs", "digests"} <= tables:
+                continue
+            for (markdown,) in connection.execute(
+                "SELECT d.markdown FROM runs r JOIN digests d ON d.run_id=r.id "
+                "WHERE r.monitor_name=? AND r.email_status='sent' ORDER BY r.id DESC",
+                (monitor_name,),
+            ):
+                heading = re.match(r"\A# [^\n]+ — ([A-Za-z]+ \d{1,2}, \d{4})\s*(?:\n|$)", markdown)
+                if heading:
+                    try:
+                        old_date = datetime.strptime(heading.group(1), "%B %d, %Y").date().isoformat()
+                    except ValueError:
+                        continue
+                    if old_date == edition_date:
+                        return markdown
+        finally:
+            connection.close()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1213,7 +1454,7 @@ def _save_run_history(*, db_path, monitor_name, time_filter, posts,
     print(f"[OK] Run #{run_id} saved to database: {db_path}")
 
 
-def main(argv=None):
+def main(argv=None, *, job_deadline=None, recovery_state=None):
     from monitor_config import list_monitors, load_monitor
 
     parser = argparse.ArgumentParser(
@@ -1244,8 +1485,17 @@ def main(argv=None):
                         help="Save run history to a SQLite database (e.g. data/reddit_monitor.db)")
     parser.add_argument("--no-db", action="store_true",
                         help="Skip database storage even if --db was previously used")
+    parser.add_argument("--history-db", type=str, default=None,
+                        help="Read delivered editorial history without writing that database (useful for offline replays)")
+    parser.add_argument("--intelligence-store", default=os.getenv("DIGEST_INTELLIGENCE_STORE"),
+                        help="Opt in to API posts, refreshed collection cache and observed-fact analysis")
+    parser.add_argument("--analysis-report", default=None,
+                        help="Local HTML/JSON analysis report (requires --intelligence-store)")
     parser.add_argument("--no-email", action="store_true",
                         help="Do not attempt email delivery")
+    parser.add_argument("--delivery-ledger", type=str,
+                        default=os.getenv("DIGEST_DELIVERY_LEDGER", str(DEFAULT_DELIVERY_LEDGER)),
+                        help="Durable duplicate-delivery ledger (also used with --no-db; --no-email never writes it)")
     parser.add_argument("--source-safe", action="store_true",
                         help="Generate a bounded, source-validated editorial digest; never email raw-comment fallback")
     parser.add_argument("--quality", choices=["off", "warn", "strict"],
@@ -1264,8 +1514,21 @@ def main(argv=None):
                         default=None,
                         help="Show recent runs from the database and exit (default: 10)")
     args = parser.parse_args(argv)
+    if args.analysis_report and not args.intelligence_store:
+        parser.error("--analysis-report requires --intelligence-store")
+    if args.intelligence_store and not args.source_safe:
+        parser.error("--intelligence-store requires --source-safe")
     if args.digest_date and not args.from_json:
         parser.error("--digest-date requires --from-json; it labels a recovered edition, not a live scrape")
+    if args.from_json and not args.no_email and not args.digest_date:
+        parser.error("--digest-date is required when emailing a saved-data replay so its subject, status and duplicate guard use the intended edition")
+    if args.from_json and args.save_raw:
+        original = Path(args.from_json).resolve()
+        target = Path(args.save_raw).resolve()
+        protected = {original, original.with_suffix(".coverage.json"), original.with_suffix(".collection-audit.json")}
+        outputs = {target, target.with_suffix(".coverage.json"), target.with_suffix(".collection-audit.json")}
+        if protected & outputs:
+            parser.error("--save-raw must use a new replay path that does not overwrite the original source, coverage or collection audit")
 
     if args.list_monitors:
         monitors = list_monitors()
@@ -1306,6 +1569,8 @@ def main(argv=None):
         return 0
 
     started_at = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
+    job_deadline = min(job_deadline, started_monotonic + 3000) if job_deadline is not None else started_monotonic + 3000
     monitor = None
     monitor_name = args.monitor or "default"
     comments = []
@@ -1319,6 +1584,15 @@ def main(argv=None):
     email_status = "disabled" if args.no_email else None
     quality_status = "disabled" if args.quality == "off" else None
     status_path = Path(args.status_file)
+    delivery_lock = None
+    published_status = False
+    edition_date = (args.digest_date or started_at.astimezone()).date().isoformat()
+    delivery_key = None
+    continuity = None
+    analysis_context, analysis_payload = None, None
+    synthesizing = False
+    if recovery_state is not None:
+        recovery_state.update(retryable=False, edition_date=edition_date, error_type=None)
 
     def finalize(status, exit_code, error=None):
         nonlocal status_path
@@ -1345,9 +1619,17 @@ def main(argv=None):
                 )
             except Exception as exc:
                 print(f"[ERROR] Could not save run history: {exc}")
-                final_status = "failed"
-                final_exit_code = final_exit_code or 1
-                final_error = final_error or "Database history save failed"
+                if email_status == "sent":
+                    # SMTP acceptance and the sent ledger are already durable.
+                    # A history outage is not a delivery failure or permission
+                    # to submit again. A later sent-edition replay can reconcile.
+                    final_status = "completed_with_warnings"
+                    final_exit_code = 0
+                    final_error = "Email delivered; database history save failed"
+                else:
+                    final_status = "failed"
+                    final_exit_code = final_exit_code or 1
+                    final_error = final_error or "Database history save failed"
         try:
             write_run_status(
                 status_path,
@@ -1358,6 +1640,7 @@ def main(argv=None):
                 digest_path=digest_path,
                 raw_json_path=raw_json_path,
                 email_status=email_status,
+                edition_date=edition_date,
                 quality_status=quality_status,
                 evaluation_path=evaluation_path,
                 error=final_error,
@@ -1397,6 +1680,9 @@ def main(argv=None):
         )
         post_sort = monitor["post_sort"] if monitor else POST_SORT
         title_filters = monitor.get("title_filters", {}) if monitor else POST_TITLE_FILTERS
+        effective_monitor = {"name": monitor_name, "subreddits": subs, "keywords": kws,
+                             "posts_per_subreddit": posts, "time_filter": tf,
+                             "post_sort": post_sort, "title_filters": title_filters}
         digest_meta = monitor.get("digest", {}) if monitor else {}
         # Keep the historical no-argument workflow; explicit custom topics and
         # monitor profiles without a preset get topic-neutral editorial behavior.
@@ -1406,6 +1692,51 @@ def main(argv=None):
             editorial_settings, audience=digest_meta.get("audience")
         )
         digest_title = digest_meta.get("title", "Churning Digest" if legacy_default else "Daily Digest")
+        if recovery_state is not None:
+            configuration = {"monitor": effective_monitor, "digest": digest_meta,
+                             "provider": LLM_COMMAND, "provider_model": os.getenv("DIGEST_CODEX_MODEL"),
+                             "quality": args.quality, "source_safe": args.source_safe}
+            if "configuration" in recovery_state and recovery_state["configuration"] != configuration:
+                raise RuntimeError("Configuration changed during recovery; no retry is permitted")
+            recovery_state["configuration"] = json.loads(json.dumps(configuration))
+
+        if not args.no_email:
+            from delivery_guard import (
+                DeliveryBusy, claim_delivery, edition_lock, get_delivery,
+                hash_content, mark_sent,
+            )
+            delivery_key = dict(monitor=monitor_name, edition_date=edition_date, destination=EMAIL_TO)
+            delivery_lock = edition_lock(args.delivery_ledger, **delivery_key)
+            try:
+                delivery_lock.__enter__()
+            except DeliveryBusy:
+                delivery_lock = None
+                print("[BLOCKED] Another process owns this edition; no files or email were changed.")
+                return 6
+            existing = get_delivery(args.delivery_ledger, **delivery_key)
+            if existing and existing["state"] == "sent":
+                from delivery_recovery import reconcile_sent
+                reconcile_sent(args.delivery_ledger, existing, status_path=status_path,
+                               db_path=args.db if not args.no_db else None)
+                print("[SKIP] This edition is already recorded as sent; no duplicate email or generation.")
+                return 0
+            if existing and existing["state"] in {"pending", "uncertain"}:
+                print("[BLOCKED] An earlier submission may have been accepted. Check Gmail and reconcile the delivery record before retrying.")
+                return 5
+            if existing is None:
+                prior = _previously_sent_edition(
+                    [args.db, args.history_db, DEFAULT_HISTORY_DB], monitor_name, edition_date,
+                )
+                if prior is not None:
+                    imported = claim_delivery(args.delivery_ledger, **delivery_key, content_hash=hash_content(prior))
+                    if imported.state == "claimed":
+                        mark_sent(args.delivery_ledger, imported)
+                    print("[SKIP] Legacy run history already records this edition as sent; duplicate delivery blocked.")
+                    return 0
+
+        if not args.from_json and tf == "day":
+            from coverage_continuity import resolve_daily_window
+            continuity = resolve_daily_window(started_at, status_path, monitor_name)
 
         if not digest_path:
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -1422,9 +1753,11 @@ def main(argv=None):
             digest_path=digest_path,
             raw_json_path=raw_json_path,
             email_status=email_status,
+            edition_date=edition_date,
             quality_status=quality_status,
             evaluation_path=evaluation_path,
         )
+        published_status = True
 
         print("=" * 60)
         print(f"  DAILY REDDIT DIGEST — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -1448,14 +1781,26 @@ def main(argv=None):
                     isinstance(w, dict) and isinstance(w.get("subreddit"), str)
                     and isinstance(w.get("reason"), str) for w in warnings
                 ):
-                    for field in ("collection_warnings", "window_start", "window_end"):
+                    for field in ("collection_warnings", "window_start", "window_end", "collector"):
                         if field in saved_coverage:
                             stats[field] = saved_coverage[field]
                     stats["replay_unknown"] = saved_coverage.get("replay_unknown", False) is not False
+            if not args.digest_date and stats.get("window_end"):
+                from factual_checks import parse_edition_cutoff
+                saved_edition = parse_edition_cutoff(stats["window_end"])
+                edition_date = saved_edition.strftime("%Y-%m-%d")
             print(f"\n[OK] Loaded {len(comments)} comments from {args.from_json} "
                   f"(skipping scrape)")
         else:
-            comments = scrape_all(
+            audit_payload = {} if args.save_raw else None
+            if args.intelligence_store:
+                from enhanced_collection import collect_enhanced
+                comments, analysis_context, analysis_payload = collect_enhanced(
+                    effective_monitor, args.intelligence_store, window_end=started_at,
+                    window_start=continuity.start if continuity else None,
+                    stats=stats, collection_audit=audit_payload)
+            else:
+                comments = scrape_all(
                 kws,
                 subs,
                 posts,
@@ -1464,32 +1809,105 @@ def main(argv=None):
                 title_filters=title_filters,
                 stats=stats,
                 window_end=started_at,
-            )
+                window_start=continuity.start if continuity else None,
+                collection_audit=audit_payload,
+                )
+            if continuity and continuity.warnings:
+                stats.setdefault("collection_warnings", []).extend(continuity.warnings)
+
+        if args.from_json and recovery_state is not None and "frozen_context" in recovery_state:
+            analysis_context = recovery_state["frozen_context"]["analysis_context"]
+            analysis_payload = recovery_state["frozen_context"]["analysis_payload"]
+            stats = dict(recovery_state["frozen_context"]["stats"])
+        elif args.from_json and args.intelligence_store:
+            from intelligence_store import IntelligenceStore, scope_key
+            with IntelligenceStore(args.intelligence_store) as store:
+                scope = scope_key(effective_monitor)
+                store.ingest(scope, comments, started_at)
+                analysis_context = store.context(scope, comments)
+                analysis_payload = store.report(scope, started_at, verified_ids={c["id"] for c in comments})
+                analysis_payload["limitations"].append("Offline replay: source availability was not checked against Reddit.")
+
+        if args.save_raw:
+            from collection_audit import replay_audit_manifest, set_audit_warnings
+            audit_path = Path(args.save_raw).with_suffix(".collection-audit.json")
+            if args.from_json:
+                original_audit = Path(args.from_json).with_suffix(".collection-audit.json")
+                audit_payload = replay_audit_manifest(
+                    comments, Path(args.from_json).resolve(),
+                    original_audit.resolve() if original_audit.is_file() else None,
+                )
+            elif audit_payload:
+                set_audit_warnings(audit_payload, stats.get("collection_warnings", []))
+            else:
+                audit_payload = {"version": 1, "mode": "live_collection", "filtering_observed": False,
+                                 "limitations": ["No collection filtering diagnostics were supplied."]}
+            atomic_write_json(args.save_raw, comments)
+            atomic_write_json(audit_path, audit_payload)
+            atomic_write_json(Path(args.save_raw).with_suffix(".coverage.json"), {
+                "collector": stats.get("collector", "unknown"),
+                "collection_warnings": stats.get("collection_warnings", []),
+                "window_start": stats.get("window_start"), "window_end": stats.get("window_end"),
+                "raw_comment_count": stats["raw_comment_count"],
+                "matched_comment_count": stats["matched_comment_count"],
+                "replay_unknown": stats.get("replay_unknown", False),
+                "collection_audit_path": audit_path.name,
+                **{key: stats[key] for key in ("source_scope", "api_requests", "source_kind_counts",
+                   "cached_sources_reused", "cache_sources_excluded", "removed_sources", "expired_cache_sources") if key in stats},
+            })
+            print(f"[OK] Raw comments saved to: {args.save_raw}")
 
         if not comments:
-            raise RuntimeError("No matching comments found; no digest was produced")
+            raise RuntimeError(_empty_collection_error(stats, replay=bool(args.from_json)))
 
         verb = "Loaded" if args.from_json else "Scraped"
         print(f"\n{'=' * 60}")
         print(f"  {verb} {len(comments)} unique comments. Summarizing...")
         print(f"{'=' * 60}")
 
-        if args.save_raw:
-            atomic_write_json(args.save_raw, comments)
-            atomic_write_json(Path(args.save_raw).with_suffix(".coverage.json"), {
-                "collection_warnings": stats.get("collection_warnings", []),
-                "window_start": stats.get("window_start"), "window_end": stats.get("window_end"),
-                "raw_comment_count": stats["raw_comment_count"],
-                "matched_comment_count": stats["matched_comment_count"],
-                "replay_unknown": stats.get("replay_unknown", False),
-            })
-            print(f"[OK] Raw comments saved to: {args.save_raw}")
-
         time_label = {"hour": "hour", "day": "24 hours", "week": "week",
                       "month": "month", "year": "year", "all": "all time"}
+        if continuity and continuity.extended:
+            hours = (continuity.end - continuity.start).total_seconds() / 3600
+            time_label["day"] = f"{hours:g} hours"
+        synthesis_window = time_label.get(tf, "24 hours")
+        recent_editions, editorial_report = [], {}
+        history_path = args.history_db or (args.db if not args.no_db else None)
+        if args.source_safe and editorial_profile.preset == "churning" and history_path:
+            from editorial_selection import recent_delivered_editions
+            # Replays must not learn from editions delivered after their window.
+            history_before = started_at
+            try:
+                if args.from_json:
+                    saved_end = stats.get("window_end")
+                    history_before = datetime.fromisoformat(saved_end.replace("Z", "+00:00")) if isinstance(saved_end, str) else None
+                    if history_before is None and args.digest_date:
+                        history_before = args.digest_date.replace(tzinfo=timezone.utc)
+                if history_before is not None:
+                    recent_editions = recent_delivered_editions(history_path, monitor_name, history_before, current_sources=comments)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                print(f"[WARN] Recent editorial history unavailable ({type(exc).__name__}); using current sources only.")
+            print(f"  Editorial history: {len(recent_editions)} delivered editions available.")
+        if recovery_state is not None:
+            if "frozen_context" in recovery_state:
+                recent_editions = recovery_state["frozen_context"]["recent_editions"]
+                synthesis_window = recovery_state["frozen_context"]["synthesis_window"]
+            else:
+                # Keep planner input identical on the single bounded retry.
+                # Re-ingesting cached facts/history could otherwise invalidate
+                # checkpoints or change the editorial decisions mid-edition.
+                recovery_state["frozen_context"] = json.loads(json.dumps({
+                    "analysis_context": analysis_context, "analysis_payload": analysis_payload, "stats": stats,
+                    "recent_editions": recent_editions, "synthesis_window": synthesis_window}))
+            recovery_state.update(raw_json_path=raw_json_path, digest_path=digest_path,
+                                  status_path=str(status_path), edition_date=edition_date)
+            if "source_fingerprints" not in recovery_state:
+                from digest_recovery import source_fingerprints
+                recovery_state["source_fingerprints"] = source_fingerprints(raw_json_path)
+        synthesizing = True
         summary = summarize(
             comments,
-            time_label.get(tf, "24 hours"),
+            synthesis_window,
             audience=digest_meta.get("audience"),
             monitor_name=monitor["name"] if monitor else None,
             description=monitor.get("description") if monitor else None,
@@ -1497,12 +1915,20 @@ def main(argv=None):
             source_safe=args.source_safe,
             artifact_dir=Path(digest_path).with_suffix(".work") if args.source_safe else None,
             editorial_profile=editorial_profile,
+            recent_editions=recent_editions,
+            editorial_report=editorial_report,
+            edition_cutoff=stats.get("window_end") or (
+                args.digest_date.date().isoformat() if args.digest_date else
+                None if args.from_json else started_at
+            ),
+            **({"analysis_context": analysis_context} if analysis_context else {}),
+            **({"job_deadline": job_deadline}
+               if args.source_safe else {}),
         )
-        if args.digest_date:
-            summary = re.sub(r"\A# [^\n]+", f"# Daily Digest — {args.digest_date:%B %d, %Y}", summary, count=1)
-        if editorial_profile.preset == "general":
-            edition = args.digest_date or started_at.astimezone()
-            summary = re.sub(r"\A# [^\n]+", lambda _: f"# {digest_title} — {edition:%B %d, %Y}", summary, count=1)
+        synthesizing = False
+        edition = datetime.fromisoformat(edition_date)
+        heading_title = digest_title if editorial_profile.preset == "general" else "Daily Digest"
+        summary = re.sub(r"\A# [^\n]+", lambda _: f"# {heading_title} — {edition:%B %d, %Y}", summary, count=1)
         summary += collection_notice(stats.get("collection_warnings", []),
                                      replay_unknown=stats.get("replay_unknown", False))
         if not args.quiet_summary:
@@ -1510,11 +1936,24 @@ def main(argv=None):
 
         atomic_write_text(digest_path, summary)
         print(f"\n[OK] Summary saved to: {digest_path}")
+        if analysis_payload is not None:
+            # Operational diagnostics must not turn a valid newsletter into a
+            # failed delivery simply because a local HTML file cannot be written.
+            try:
+                from analysis_report import collection_diagnostics, write_report
+                analysis_payload["collection_diagnostics"] = collection_diagnostics(comments)
+                report_path = args.analysis_report or str(Path(args.intelligence_store).with_name("analysis.html"))
+                write_report(report_path, analysis_payload, editorial=editorial_report)
+                print(f"[OK] Local analysis report: {report_path}")
+            except OSError as exc:
+                print(f"[WARN] Local analysis report could not be written ({type(exc).__name__}).")
 
         if args.quality != "off":
             from evaluate_digest import evaluate, evaluation_passed, format_report
 
             quality_results = evaluate(summary, comments, financial_checks=editorial_profile.financial_checks)
+            if editorial_report:
+                quality_results["editorial_selection"] = editorial_report
             if args.source_safe:
                 # A digest intentionally excludes irrelevant material. Keep raw
                 # author coverage visible, but don't force it into the email.
@@ -1537,12 +1976,48 @@ def main(argv=None):
         if args.no_email:
             print("[SKIP] Email disabled by --no-email.")
         else:
-            date_str = (args.digest_date or started_at.astimezone()).strftime("%B %d, %Y")
-            email_status = send_email(
-                f"{digest_title} — {date_str}", summary, subreddits=subs
+            from delivery_guard import (
+                claim_delivery, hash_content, mark_retryable, mark_sent, mark_uncertain,
             )
+            date_str = (args.digest_date or started_at.astimezone()).strftime("%B %d, %Y")
+            from delivery_recovery import save_receipt
+            save_receipt(args.delivery_ledger, delivery_key, summary,
+                         status_path=status_path, db_path=args.db if not args.no_db else None,
+                         started_at=started_at, digest_path=digest_path, raw_json_path=raw_json_path,
+                         evaluation_path=evaluation_path, quality_status=quality_status,
+                         collection_warnings=stats.get("collection_warnings", []),
+                         time_filter=tf, posts=posts, raw_comment_count=stats.get("raw_comment_count", len(comments)))
+            claim = claim_delivery(args.delivery_ledger, **delivery_key, content_hash=hash_content(summary))
+            if claim.state != "claimed":
+                email_status = "duplicate_blocked" if claim.state == "sent" else "uncertain"
+                return finalize("failed", 5, "Delivery already sent or uncertain; no SMTP attempt made")
+            try:
+                email_status = send_email(
+                    f"{digest_title} — {date_str}", summary, subreddits=subs,
+                    message_id=claim.message_id,
+                )
+            except Exception:
+                email_status = "uncertain"
+                mark_uncertain(args.delivery_ledger, claim)
+                raise
+            if email_status == "sent":
+                # Commit acceptance before optional run-history/status writes.
+                # A failed ledger write leaves a durable pending claim, blocking retry.
+                try:
+                    mark_sent(args.delivery_ledger, claim)
+                except Exception:
+                    email_status = "uncertain"
+                    raise
+            elif email_status in {"failed", "skipped"}:
+                mark_retryable(args.delivery_ledger, claim)
+            else:
+                mark_uncertain(args.delivery_ledger, claim)
+                email_status = "uncertain"
+                return finalize("failed", 5, "SMTP outcome uncertain; review Gmail before reconciling delivery")
             if email_status == "failed":
                 return finalize("failed", 4, "Digest email delivery failed")
+            if email_status != "sent":
+                return finalize("failed", 4, "Digest email was not sent; configure SMTP credentials or use --no-email for previews")
 
         status = (
             "completed_with_warnings"
@@ -1551,10 +2026,16 @@ def main(argv=None):
         )
         return finalize(status, 0)
     except Exception as exc:
+        if recovery_state is not None:
+            recovery_state.update(error_type=type(exc).__name__,
+                                  retryable=synthesizing and isinstance(exc, LLMTimeoutError))
         print(f"\nERROR: {exc}")
         if args.save_raw and comments:
             print(f"Raw data is available at {args.save_raw}.")
-        return finalize("failed", 1, str(exc)[:500])
+        return finalize("failed", 1, str(exc)[:500]) if published_status else 1
+    finally:
+        if delivery_lock is not None:
+            delivery_lock.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

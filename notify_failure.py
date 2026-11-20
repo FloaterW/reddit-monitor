@@ -31,6 +31,43 @@ def read_log_tail(log_path, lines=LOG_TAIL_LINES):
         return f"(could not read {log_path}: {e})"
 
 
+def recovery_guidance(log_tail):
+    """Do not suggest model reauthentication or replaying an empty collection."""
+    if any(marker in log_tail for marker in (
+        "API request failed:", "API source scope:", "API collection", "API listing",
+        "REDDIT_CLIENT_ID", "REDDIT_API_USER_AGENT", "DIGEST_REDDIT_SOURCE",
+    )):
+        return (
+            "Reddit API collection could not complete. Check the configured installed-app "
+            "client ID, API User-Agent, access status and reported HTTP/rate-limit errors. "
+            "See docs/COLLECTION_ACCESS.md. Do not switch to retired RSS or change AI "
+            "credentials to resolve an API access failure.\n"
+            "An empty saved JSON file cannot recover a missed edition. Use only nonempty, "
+            "dated saved comments for recovery.\n"
+        )
+    if any(marker in log_tail for marker in (
+        "Reddit collection failed:", "RSS request failed:", "Total comments fetched: 0",
+    )):
+        return (
+            "Collection failed before a newsletter could be generated. Check the HTTP/feed "
+            "errors above. Reddit announced RSS retirement for November 13, 2026; "
+            "see docs/COLLECTION_ACCESS.md for supported-source migration requirements.\n"
+            "An empty saved JSON file cannot recover the missed edition. Restore a supported "
+            "data source before retrying; changing AI credentials will not restore Reddit feeds.\n"
+        )
+    if "Saved input contains no comments" in log_tail:
+        return "The selected saved file is empty. Recovery requires nonempty, dated source comments.\n"
+    return (
+        "For authentication errors, check the configured provider: Claude uses\n"
+        "its interactive /login; Codex uses 'codex login status' and 'codex login'.\n"
+        "To preview a recovered edition from nonempty saved comments without re-scraping or sending an email:\n"
+        "  python daily_digest.py --monitor churning --from-json <raw>.json "
+        "--digest-date YYYY-MM-DD --source-safe --quality strict --no-email --no-db "
+        "--save data/recovery.md --status-file data/recovery.status.json\n"
+        "Review the preview before sending. Keep the original raw file.\n"
+    )
+
+
 def main():
     exit_code = sys.argv[1] if len(sys.argv) > 1 else "unknown"
 
@@ -46,21 +83,16 @@ def main():
         return 1
 
     stamp = datetime.now().strftime("%B %d, %Y at %H:%M")
+    log_tail = read_log_tail(log_path)
     body = (
         f"The Reddit digest run failed on {stamp}.\n"
         f"Exit code: {exit_code}\n"
         f"Log file: {log_path}\n\n"
         f"Last {LOG_TAIL_LINES} lines of the log:\n"
         f"{'-' * 60}\n"
-        f"{read_log_tail(log_path)}\n"
+        f"{log_tail}\n"
         f"{'-' * 60}\n\n"
-        f"For authentication errors, check the configured provider: Claude uses\n"
-        f"its interactive /login; Codex uses 'codex login status' and 'codex login'.\n"
-        f"To preview a recovered edition without re-scraping or sending an email:\n"
-        f"  python daily_digest.py --monitor churning --from-json <raw>.json "
-        f"--digest-date YYYY-MM-DD --source-safe --quality strict --no-email --no-db "
-        f"--save data/recovery.md --status-file data/recovery.status.json\n"
-        f"Review the preview before sending. Keep the original raw file.\n"
+        f"{recovery_guidance(log_tail)}"
     )
 
     msg = MIMEText(body, "plain", "utf-8")

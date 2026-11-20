@@ -2,7 +2,7 @@
 
 The churning monitor is the project's real-world application, not a requirement of the core pipeline. It follows credit-card rewards, bank bonuses, eligibility reports and award travel across five subreddits. The configured keywords and title filters live in [churning.json](../config/monitors/churning.json).
 
-The normal Windows wrapper explicitly selects `--monitor churning --source-safe --quality strict`. The profile selects the `churning` editorial preset and enables narrow financial arithmetic checks. The profile refactor preserves the original extraction and writing prompts byte-for-byte, along with collection settings, source gates, and email formatting. It does not install or modify a schedule.
+The normal Windows wrapper explicitly selects `--monitor churning --source-safe --quality strict`. The profile selects the `churning` editorial preset and enables narrow financial arithmetic checks. The established writing/style rules, source gates, and email formatting remain in place. Extraction prioritization and global story planning now preserve important offers and application outcomes while consolidating repeated coverage; see [editorial selection](EDITORIAL_SELECTION.md). Selecting a profile does not install or modify a schedule.
 
 ## Engineering lessons
 

@@ -290,3 +290,95 @@ def test_claude_quota_error_survives_status_message_length_cap():
         digest._invoke_llm("SOURCE COMMENTS:\n[]", structured=True)
     assert "session limit" in str(error.value)[:500]
     assert "11:50pm" in str(error.value)[:500]
+
+
+def test_codex_terminal_auth_error_is_visible_redacted_and_retryable():
+    events = [
+        {"type": "item.completed", "item": {"type": "error", "message": "startup warning " * 100}},
+        {"type": "turn.failed", "error": {"message":
+            "unexpected status 401 Unauthorized: Incorrect API key provided: sk-test-secret-value"}},
+    ]
+    with patch.object(digest, "_build_llm_command", return_value=["codex.exe", "exec"]), patch.object(
+        digest.subprocess, "run", return_value=subprocess.CompletedProcess(
+            [], 1, "\n".join(map(json.dumps, events)), "")
+    ), pytest.raises(digest.LLMTransientError) as error:
+        digest._invoke_llm("SOURCE COMMENTS:\n[]", structured=True)
+    assert "401 Unauthorized" in str(error.value)[:500]
+    assert "sk-test-secret-value" not in str(error.value)
+    assert "login" in str(error.value)
+
+
+@pytest.mark.parametrize("message", ["unexpected status 503 Service Unavailable",
+                                     "stream disconnected before completion: websocket closed by server"])
+def test_codex_terminal_transport_error_is_retryable(message):
+    output = json.dumps({"type": "turn.failed", "error": {"message": message}})
+    with patch.object(digest, "_build_llm_command", return_value=["codex.exe", "exec"]), patch.object(
+        digest.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, output, "")
+    ), pytest.raises(digest.LLMTransientError):
+        digest._invoke_llm("SOURCE COMMENTS:\n[]", structured=True)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_transient_provider_failure_retries_once_and_keeps_validation(persistent):
+    calls = []
+    def invoke(prompt, **kwargs):
+        calls.append(prompt)
+        if len(calls) == 1 or persistent:
+            raise digest.LLMTransientError("temporary provider authentication failure")
+        return json.dumps(doc())
+    notes = [{"topic": "credit", "text": "Received $50.", "source_ids": ["t1_a"]}]
+    if persistent:
+        with pytest.raises(digest.LLMTransientError):
+            verified.summarize_verified([source()], None, invoke, recovered_notes=notes)
+    else:
+        assert "$50" in verified.summarize_verified([source()], None, invoke, recovered_notes=notes)
+    assert len(calls) == 2
+
+
+def test_transient_provider_retry_respects_total_budget():
+    elapsed = [0.0]
+    calls = []
+    def invoke(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        elapsed[0] += kwargs["timeout"]
+        raise digest.LLMTransientError("temporary disconnect")
+    with patch.object(verified.time, "monotonic", side_effect=lambda: elapsed[0]), patch.object(
+        verified, "AI_BUDGET_SECONDS", 10
+    ), pytest.raises(digest.LLMTransientError):
+        verified.summarize_verified([source()], lambda rows: [rows], invoke)
+    assert calls == [10]
+
+
+@pytest.mark.parametrize("message", ["refresh token expired; please log in", "usage limit reached"])
+def test_codex_permanent_auth_or_quota_is_not_transient(message):
+    output = json.dumps({"type": "turn.failed", "error": {"message": message}})
+    with patch.object(digest, "_build_llm_command", return_value=["codex.exe", "exec"]), patch.object(
+        digest.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, output, "")
+    ), pytest.raises(RuntimeError) as error:
+        digest._invoke_llm("SOURCE COMMENTS:\n[]", structured=True)
+    assert not isinstance(error.value, digest.LLMTransientError)
+
+
+def test_codex_401_restarts_cli_then_validates_completed_response():
+    failure = json.dumps({"type": "turn.failed", "error": {
+        "message": "unexpected status 401 Unauthorized"}})
+    success = "\n".join(map(json.dumps, [
+        {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(doc())}},
+        {"type": "turn.completed"},
+    ]))
+    notes = [{"topic": "credit", "text": "Received $50.", "source_ids": ["t1_a"]}]
+    with patch.object(digest, "_build_llm_command", side_effect=lambda: ["codex.exe", "exec", "-"]), patch.object(
+        digest.subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 1, failure, ""),
+            subprocess.CompletedProcess([], 0, success, ""),
+        ]
+    ) as run:
+        result = verified.summarize_verified([source()], None, digest._invoke_llm, recovered_notes=notes)
+    assert run.call_count == 2
+    assert "$50" in result and "[u/alice]" in result
+    assert run.call_args_list[0].kwargs["cwd"] != run.call_args_list[1].kwargs["cwd"]
+
+
+def test_provider_error_redacts_bearer_and_masked_key():
+    assert digest._redact_provider_error("Bearer token.value sk-svcac*****suffix") == (
+        "Bearer [redacted] [redacted key]")

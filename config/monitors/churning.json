@@ -5,7 +5,7 @@
   "keywords": [
     "chase", "amex", "citi", "capital one",
     "sapphire", "ink",
-    "CIP", "CIC", "CSR", "CSP", "CIU",
+    "CIP", "CIC", "CSR", "CSRB", "CSP", "CIU",
     "c1", "vx", "bonvoy",
     "SUB", "bonus", "retention",
     "paze", "bilt", "palladium",
@@ -34,7 +34,9 @@
     "award space", "sweet spot", "fuel surcharge", "dynamic pricing",
     "direct deposit", "ChexSystems", "Early Warning Services", "checking offer",
     "savings offer", "brokerage offer", "account closure", "early termination fee",
-    "minimum spend", "MSR", "manufactured spending", "gift card", "VGC", "MCGC",
+    "minimum spend", "MSR", "manufactured spending", "manufactured spend", "MS",
+    "buying group", "buying groups", "BFMR", "Buy For Me Retail",
+    "Amazon", "Prime", "Best Buy", "gift card", "VGC", "MCGC",
     "Obsidian", "Cardless", "Rent Day", "rent reporting",
     "Savor", "Surpass", "Aspire", "Boundless", "BCP", "BCE", "Blue Cash",
     "sole prop", "sole proprietor", "EIN", "product change", "product conversion",
@@ -52,6 +54,7 @@
     "audience": "credit card churning and award travel enthusiasts",
     "editorial": {
       "preset": "churning",
+      "priorities": "Include substantive manufactured-spending and buying-group developments: BFMR/Buy For Me Retail, payouts, order acceptance or cancellations, purchase limits, merchant promotions and reward exclusions. Amazon, Prime, Best Buy and MS keyword matches are candidates, not inherently news. Omit routine shopping chatter and vague replies such as an unspecified issue with Amazon when the supplied body and available parents do not explain what happened. Keep useful concrete reports and uncertainties; never invent missing details.",
       "financial_checks": true
     }
   }

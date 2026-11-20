@@ -33,6 +33,15 @@ def test_variants_preserve_boundaries(keyword, text):
     assert not scraper._matches_query(keyword, text)
 
 
+def test_csr_business_shorthand_survives_keyword_filtering():
+    profile = load_monitor("churning")
+    report = {"id": "t1_csr", "body": "I was denied for CSRB.", "post_title": "Question Thread"}
+    with patch.object(digest, "_fetch_all_comments", return_value=[report]):
+        matched = digest.scrape_all(profile["keywords"], profile["subreddits"], 100, "all")
+    assert [row["id"] for row in matched] == ["t1_csr"]
+    assert "CSRB" in matched[0]["matched_keywords"]
+
+
 def test_reply_inherits_old_parent_without_promoting_old_news():
     parent = {"id": "t1_parent", "body": "Chase offer details", "created": "2020-01-01 00:00 UTC",
               "post_permalink": "https://reddit.com/r/test/comments/p/topic/"}

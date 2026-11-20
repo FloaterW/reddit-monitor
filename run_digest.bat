@@ -39,7 +39,7 @@ if exist digest_run.log (
 )
 
 echo [%date% %time%] Starting digest run... >> digest_run.log
-%PYTHON_CMD% daily_digest.py --monitor churning --source-safe --save "digest_%STAMP%.md" --save-raw "digest_%STAMP%.json" --db data/monitor.db --status-file data/last_run_status.json --quality strict --quiet-summary >> digest_run.log 2>&1
+%PYTHON_CMD% digest_recovery.py --monitor churning --source-safe --intelligence-store data/api-analysis/cache.db --save "digest_%STAMP%.md" --save-raw "digest_%STAMP%.json" --db data/monitor.db --status-file data/last_run_status.json --quality strict --quiet-summary >> digest_run.log 2>&1
 set EXITCODE=%ERRORLEVEL%
 echo [%date% %time%] Finished with exit code %EXITCODE% >> digest_run.log
 

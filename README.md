@@ -4,14 +4,18 @@ A configurable Reddit monitoring and email-digest pipeline. Choose communities a
 
 Built around a real daily credit-card rewards newsletter, with a separate job-market example showing how the same pipeline supports another topic. Collection is bounded; this project does not promise exhaustive Reddit coverage.
 
+**Live collection notice (November 18, 2026):** Reddit retired RSS support on November 13. Daily digests can use an existing working installed-app OAuth client through the optional API collector. Access must be configured and tested; the legacy RSS adapter is not a reliable production source. Saved-input replay and the offline demo remain usable. See [collection access and migration requirements](docs/COLLECTION_ACCESS.md).
+
 ## What it does
 
-- Collects posts/comments through the existing HTML/RSS adapters and filters comments using monitor settings.
+- Collects recent comments and available parent replies through a configured Reddit API client, or uses the legacy HTML/RSS adapters, then filters comments using monitor settings.
 - Deduplicates comments, keeps available reply context, and reports collection limitations.
 - Uses a configured AI CLI to extract relevant notes and write a themed newsletter.
 - Constructs citations from known sources and checks supported numeric claims before delivery in source-safe mode.
 - Renders sanitized Markdown and HTML, optionally sends through Gmail, and records run outcomes.
 - Supports saved-data replay, SQLite history, bounded retries, and a scheduled-run watchdog.
+- Resumes one eligible synthesis timeout from pinned saved data and checkpoints within the original job deadline.
+- Records each email submission durably and blocks duplicate or uncertain submissions for the same monitor, edition, and recipient.
 
 ## Try it without accounts or network access
 
@@ -74,11 +78,20 @@ Monitor JSON → Collection and filtering → Structured AI extraction/writing
 
 The main modules are:
 
-- `reddit_scraper.py`: collection and pagination.
+- `reddit_api.py`: bounded installed-client OAuth collection and parent-context retrieval.
+- `reddit_scraper.py`: legacy collection, common request budgets and keyword matching.
 - `monitor_config.py` / `editorial_profiles.py`: validated configuration and editorial presets.
 - `daily_digest.py`: orchestration, provider isolation, outputs, and delivery.
 - `verified_digest.py`: bounded source-safe extraction, writing, and rendering.
+- `editorial_selection.py`: churning offer/application recall, shared story planning, and recent delivered-history context.
+- `published_story_memory.py` / `editorial_novelty.py`: compact published-story lookup and conservative checks for repeated facts in the final draft.
+- `editorial_retention.py` / `omission_review.py`: bounded omission review and source-specific material-detail checks.
+- `editorial_trace.py` / `collection_audit.py`: local selection and filtering diagnostics, with explicit gaps and limits.
 - `evaluate_digest.py`, `editorial_checks.py`, `financial_checks.py`: shared checks and optional financial rules.
+- `factual_checks.py` / `topic_attribution.py`: bounded identity, outcome, deadline and discussion-context checks for the churning preset.
+- `delivery_guard.py` / `manage_delivery.py`: durable submission records and explicit reconciliation of uncertain outcomes.
+- `digest_recovery.py` / `delivery_recovery.py`: bounded timeout recovery and repair of local history/status after a confirmed submission.
+- `coverage_continuity.py`: daily window planning with a maximum one-hour extension after the previous delivered boundary.
 - `storage.py`, `check_digest_ran.py`, `notify_failure.py`: persistence and run monitoring.
 
 ## Real-world case study: credit-card rewards
@@ -89,22 +102,26 @@ The existing `run_digest.bat` selects the churning profile. The refactor does no
 
 Read the [case study](docs/CHURNING_CASE_STUDY.md). The included [historical sample](example_digest.md) illustrates formatting, not current offers or verified advice.
 
+The churning preset also consolidates related notes before writing, compares them with up to seven prior delivered editions when a history database is available, and checks that detected Ink/Reserve Business offer and application leads survive summarization. See [editorial selection and replay](docs/EDITORIAL_SELECTION.md) for the checks and their limits.
+
 ## Testing and security
 
 ```powershell
-python -m pip install -r requirements-dev-lock.txt
+python -m pip install -r requirements-test-lock.txt
 python -m pytest -q
 python -m ruff check .
+# Security audit tools require Python 3.11+:
+python -m pip install -r requirements-dev-lock.txt
 python -m pip_audit -r requirements-dev-lock.txt
 ```
 
-Tests use static inputs and mocked service boundaries. CI checks Windows/Linux with Python 3.10 and 3.12, enforces coverage, and audits dependencies. CodeQL provides additional static analysis. Regression tests verify exact churning-prompt preservation and that other profiles do not inherit its editorial instructions.
+Tests use static inputs and mocked service boundaries. CI checks Windows/Linux with Python 3.10 and 3.12, enforces coverage, and audits dependencies. CodeQL provides additional static analysis. Regression tests preserve the churning newsletter's writing style and source rules, check offer recall and story planning, and verify that other profiles do not inherit its editorial instructions.
 
 Passwords, local environment files, raw runs, databases, logs, and investigation notes are excluded from Git. SMTP uses certificate and hostname verification. See [SECURITY.md](SECURITY.md) for the security model and audit limitations.
 
 ## Known limitations
 
-- Reddit throttling, feed changes, page/time budgets, and unavailable parent context can leave gaps. Standalone post bodies without comments are not included in the digest collector.
+- Reddit throttling, feed changes, page/time budgets, and unavailable parent context can leave gaps. The opt-in [API analysis path](docs/API_ANALYSIS.md) includes standalone posts, refreshed midday collection and local reported-fact diagnostics; the basic collector remains comment-focused.
 - Technical endpoint access does not establish permission to collect or reuse data.
 - Source checks catch particular errors, not every factual or contextual mistake. Reddit claims are not independently verified.
 - The generic profile has an offline demonstration; the churning profile is the established operational use case.
