@@ -252,3 +252,101 @@ def test_different_same_amount_product_in_same_source_does_not_inherit_ink_varia
     source = {**VARIANT_SOURCE, "body": "Ink Cash and Unlimited both offer $1200 back. My Sapphire card offers a $1200 bonus."}
     note = {"text": "Ink Cash and Unlimited both offer $1200 back.", "source_ids": [source["id"]]}
     assert not retention_issues(document(text, source["id"], title="Sapphire offer"), [note], [source])
+
+
+PROMOTION_SOURCE = {"id": "t1_promotion_example", "body":
+                    "Holiday shopping offer: targeted cardholders can earn 1000 bonus points after spending $500 in everyday purchases. "
+                    "Statement-credit redemptions offer up to 100% more value, depending on the card. No transfer bonus is available."}
+
+
+@pytest.mark.parametrize("selected", [
+    "Statement-credit redemptions offer up to 100% more value, depending on the card. No transfer bonus is available.",
+    "A statement-credit redemption bonus offers up to 100% more value.",
+    "There is no transfer bonus. A status match is available.",
+])
+def test_unselected_shopping_spend_does_not_attach_to_redemption_or_transfer_remarks(selected):
+    note = {"text": selected, "source_ids": [PROMOTION_SOURCE["id"]]}
+    assert "spend_qualification" not in kinds([note], [PROMOTION_SOURCE])
+    assert not retention_issues(document(selected, PROMOTION_SOURCE["id"]), [note], [PROMOTION_SOURCE])
+
+
+@pytest.mark.parametrize("wording", ["$500 in everyday purchases", "$500 in eligible purchases",
+                                    "$500 in qualifying purchases", "spending $500"])
+def test_selected_shopping_bonus_retains_its_genuine_purchase_requirement(wording):
+    note = {"text": "The targeted shopping offer awards 1000 bonus points after $500 spend.", "source_ids": [PROMOTION_SOURCE["id"]]}
+    good = f"Targeted cardholders earn 1000 bonus points after {wording}."
+    assert not retention_issues(document(good, PROMOTION_SOURCE["id"]), [note], [PROMOTION_SOURCE])
+    bad = "Targeted cardholders earn 1000 bonus points. Statement-credit redemptions offer up to 100% more value."
+    assert any("$500" in issue for issue in retention_issues(document(bad, PROMOTION_SOURCE["id"]), [note], [PROMOTION_SOURCE]))
+
+
+def test_removed_duplicate_shopping_claim_does_not_require_restoring_it_with_redemption_fact():
+    note = {"text": "A targeted shopping bonus and a statement-credit redemption boost were reported.", "source_ids": [PROMOTION_SOURCE["id"]]}
+    draft = document("Statement-credit redemptions offer up to 100% more value. No transfer bonus is available.", PROMOTION_SOURCE["id"])
+    assert not retention_issues(draft, [note], [PROMOTION_SOURCE])
+
+
+@pytest.mark.parametrize("other", ["redemption bonus", "transfer bonus", "statement credit"])
+def test_another_benefits_same_spend_cannot_satisfy_the_shopping_bonus(other):
+    note = {"text": "A targeted shopping bonus was reported.", "source_ids": [PROMOTION_SOURCE["id"]]}
+    draft = document(f"The targeted shopping bonus awards 1000 points. The {other} requires $500 spend.", PROMOTION_SOURCE["id"])
+    assert retention_issues(draft, [note], [PROMOTION_SOURCE])
+
+
+def test_selected_percentage_redemption_bonus_is_not_an_unselected_shopping_bonus():
+    other = {"id": "t1_redemption_reply", "body": "My wallet shows a 50% bonus on statement-credit redemptions."}
+    notes = [{"text": "Statement-credit redemptions offer up to 100% more value. No transfer bonus is available.",
+              "source_ids": [PROMOTION_SOURCE["id"]], "editorial_story": "Redemptions"},
+             {"text": other["body"], "source_ids": [other["id"]], "editorial_story": "Redemptions"}]
+    assert "spend_qualification" not in kinds(notes, [PROMOTION_SOURCE, other])
+    assert not retention_issues(document(other["body"], other["id"]), notes, [PROMOTION_SOURCE, other])
+
+
+def test_explicit_percentage_bonus_spending_condition_remains_protected():
+    source = {"id": "t1_percentage_offer", "body": "A 50% bonus requires $500 spend."}
+    note = {"text": source["body"], "source_ids": [source["id"]]}
+    assert not retention_issues(document(source["body"], source["id"]), [note], [source])
+    assert retention_issues(document("A 50% bonus is offered.", source["id"]), [note], [source])
+
+
+def test_selected_parent_shopping_qualification_survives_scoped_duplicate_removal():
+    reply = {"id": "t1_shopping_reply", "body": "I received this targeted offer.",
+             "parent_context": [PROMOTION_SOURCE]}
+    note = {"text": "Targeted cardholders earn 1000 bonus points after $500 in everyday purchases.",
+            "source_ids": [reply["id"]]}
+    requirements = [f for f in selected_note_requirements([note], [reply]) if f["kind"] == "spend_qualification"]
+    assert len(requirements) == 1
+    assert set(requirements[0]["evidence_source_ids"]) == {reply["id"], PROMOTION_SOURCE["id"]}
+    # One source supplies distinct shopping and redemption benefits. Keeping
+    # one shopping clause is enough after its repetitions have been removed.
+    doc = document(note["text"], PROMOTION_SOURCE["id"])
+    doc["sections"].extend(document("Statement-credit redemptions offer up to 100% more value, depending on the card.",
+                                   PROMOTION_SOURCE["id"], title="Redemptions")["sections"])
+    assert not retention_issues(doc, [note], [reply])
+    doc["sections"][0]["bullets"][0]["text"] = "Targeted cardholders earn 1000 bonus points."
+    assert any("$500" in issue for issue in retention_issues(doc, [note], [reply]))
+    doc["sections"] = doc["sections"][1:]
+    assert not retention_issues(doc, [note], [reply])
+
+
+@pytest.mark.parametrize("selected", [
+    "A targeted shopping bonus was reported.",
+    "The shopping bonus requires $600 spend.",
+    "A statement credit requires $500 spend.",
+    "A 50% bonus on redemptions requires $500 spend.",
+    "Does the shopping bonus require $500 spend?",
+    "Statement-credit redemptions offer up to 100% more value.",
+])
+def test_parent_spend_is_not_promoted_without_explicit_selected_matching_relationship(selected):
+    reply = {"id": "t1_reply_example", "body": "Additional details.", "parent_context": [PROMOTION_SOURCE]}
+    note = {"text": selected, "source_ids": [reply["id"]]}
+    assert "spend_qualification" not in kinds([note], [reply])
+
+
+def test_distinct_generic_benefits_with_same_spending_amount_do_not_deduplicate():
+    source = {"id": "t1_multiple_benefits", "body": "A 1000 point bonus requires $500 spend. A statement credit requires $500 spend."}
+    note = {"text": source["body"], "source_ids": [source["id"]]}
+    facts = [f for f in selected_note_requirements([note], [source]) if f["kind"] == "spend_qualification"]
+    assert {f["benefit_term"] for f in facts} == {"bonus", "credit"}
+    bad = "A 1000 point bonus requires $500 spend. A statement credit is also available."
+    assert retention_issues(document(bad, source["id"]), [note], [source])

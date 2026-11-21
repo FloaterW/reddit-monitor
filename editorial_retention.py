@@ -17,7 +17,7 @@ _PC_EVENT = re.compile(r"\b(?:converted|downgraded|upgraded|PC['’]?(?:ed|d)|pr
 _PC_BLOCK = re.compile(r"\bno\s+(?:PC|product[- ]change|conversion)\s+options?\b|"
                        r"\b(?:unable|cannot|couldn['’]t|can['’]t|refused|blocked)\b.{0,40}\b(?:PC|convert|conversion|product[- ]change)\b", re.I)
 _NEGATION = re.compile(r"\b(?:not|never|no|without|neither)\b|n['’]t\b", re.I)
-_SPEND_AFTER_AMOUNT = re.compile(rf"(?<!\w)({_NUMBER})\s+(?:in\s+)?(?:spend(?:ing)?|purchases?)\b", re.I)
+_SPEND_AFTER_AMOUNT = re.compile(rf"(?<!\w)({_NUMBER})\s+(?:in\s+)?(?:spend(?:ing)?|(?:(?:everyday|eligible|qualifying)\s+)?purchases?)\b", re.I)
 _SPEND_BEFORE_AMOUNT = re.compile(
     rf"\b(?:spend(?:ing)?(?:\s+(?:requirement|threshold|minimum))?|minimum\s+spend(?:ing)?)"
     rf"\s*(?:(?:of|is|was|at least|a total of|spending|spend)\s+)?({_NUMBER})(?!\w)", re.I)
@@ -62,6 +62,18 @@ def _spend_values(text):
     return list(dict.fromkeys((_number(m.group(1)), m.group(1)) for m in _spend_matches(text)))
 
 
+def _generic_benefit_term(clause, match):
+    term = match.group().casefold()
+    if term == "bonus":
+        modifier = re.search(r"\b(retention|upgrade|referral|anniversary|transfer|redemption)\s+$",
+                             clause[:match.start()], re.I)
+        if modifier:
+            return modifier.group(1).casefold() + " bonus"
+        if re.search(r"\d+(?:\.\d+)?\s*%\s+$", clause[:match.start()]):
+            return "percentage bonus"
+    return term
+
+
 def _qualification_facts(body):
     facts = []
     for sentence in _sentences(body):
@@ -96,12 +108,7 @@ def _qualification_facts(body):
                                   and other.end() <= max(spend.start(), benefit.start())
                                   for _, other in benefits if other != benefit)
                     if explicit and len(bridge) <= 80 and not crosses and not _NEGATION.search(bridge):
-                        term = benefit.group().casefold()
-                        if name == "credit or bonus" and term == "bonus":
-                            modifier = re.search(r"\b(retention|upgrade|referral|anniversary)\s+$",
-                                                 clause[:benefit.start()], re.I)
-                            if modifier:
-                                term = modifier.group(1).casefold() + " bonus"
+                        term = _generic_benefit_term(clause, benefit) if name == "credit or bonus" else benefit.group().casefold()
                         links.append((len(bridge), name, term))
                 if links:
                     _, benefit, term = min(links, key=lambda link: (link[0], link[1]))
@@ -123,7 +130,33 @@ def _same_qualifying_benefit(left, right):
     # Preserve existing benefit categories and matches. Only bridge the known
     # bonus/welcome-bonus mismatch when the generic match was literally bonus,
     # not a credit/certificate or an explicitly different bonus subtype.
-    return left["benefit"] == right["benefit"] or (_bonus_alias(left) and _bonus_alias(right))
+    if _bonus_alias(left) and _bonus_alias(right):
+        return True
+    if left["benefit"] != right["benefit"]:
+        return False
+    if left["benefit"] == "credit or bonus":
+        return re.sub(r"\s", "", left.get("benefit_term", "")) == re.sub(r"\s", "", right.get("benefit_term", ""))
+    return True
+
+
+def _benefit_mentioned(text, fact):
+    """The generic category is not permission to substitute a different benefit."""
+    if fact["benefit"] != "credit or bonus" and not _bonus_alias(fact):
+        return bool(_BENEFITS[fact["benefit"]].search(text))
+    pattern = (_BENEFITS["welcome bonus"].pattern + "|" + _BENEFITS["credit or bonus"].pattern
+               if _bonus_alias(fact) else _BENEFITS["credit or bonus"].pattern)
+    for clause in _sentences(text):
+        for match in re.finditer(pattern, clause, re.I):
+            if re.search(r"\b(?:no|without|neither)\s+$", clause[:match.start()], re.I):
+                continue
+            if re.match(r"\s+(?:(?:is|was|are|were)\s+)?(?:not|never)\s+(?:available|offered|included)\b", clause[match.end():], re.I):
+                continue
+            term = _generic_benefit_term(clause, match)
+            mentioned = {"benefit": "welcome bonus"} if _BENEFITS["welcome bonus"].fullmatch(match.group()) else {
+                "benefit": "credit or bonus", "benefit_term": term}
+            if _same_qualifying_benefit(mentioned, fact):
+                return True
+    return False
 
 
 def _token(value):
@@ -422,6 +455,7 @@ def selected_note_requirements(notes, comments):
             # prior condition or another product mention is not a new mandate.
             selected_text = " ".join(_plain(other.get("text", "")) for other in group if sid in other.get("source_ids", []))
             deposit_notes, shared_notes = _direct_deposit_facts(selected_text), _shared_offer_facts(selected_text)
+            selected_qualifications = _qualification_facts(selected_text)
             # A selected reply may explicitly retain an offer from its supplied
             # parent. Preserve that selected fact, without promoting other old
             # parent material or an independently excluded extraction note.
@@ -442,8 +476,17 @@ def selected_note_requirements(notes, comments):
                 for fact in _shared_offer_facts(evidence_body):
                     if any(fact["cards"] == n["cards"] and fact["amount"] == n["amount"] for n in shared_notes):
                         facts.append({"kind": "shared_offer_variants", **fact, **binding})
+                if evidence_id != sid:
+                    # Parent spending conditions are selected only when this
+                    # reply's note explicitly retains the same spend/benefit
+                    # relationship. A nearby redemption or status-match note
+                    # must not promote an unselected parent's shopping offer.
+                    for fact in _qualification_facts(evidence_body):
+                        if any(fact["amount"] == n["amount"] and _same_qualifying_benefit(fact, n)
+                               for n in selected_qualifications):
+                            facts.append({"kind": "spend_qualification", **fact, **binding})
             for fact in _qualification_facts(body):
-                if _BENEFITS[fact["benefit"]].search(note_text):
+                if _benefit_mentioned(note_text, fact):
                     facts.append({"kind": "spend_qualification", **fact})
             if re.search(r"\b(?:PC|product[- ]change|convert\w*|conversion|downgrad\w*)\b", note_text, re.I):
                 facts.extend({"kind": "contrasting_product_change", **fact} for fact in _product_change_facts(body))
@@ -456,7 +499,7 @@ def selected_note_requirements(notes, comments):
                         facts.append({"kind": "event_age", **fact})
             for fact in facts:
                 evidence_id = fact.get("evidence_source_id", sid)
-                key = (evidence_id, fact["kind"], fact.get("amount"), fact.get("benefit"),
+                key = (evidence_id, fact["kind"], fact.get("amount"), fact.get("benefit"), fact.get("benefit_term"),
                        tuple(fact.get("destination_terms", [])), fact.get("event_age"),
                        tuple(fact.get("cards", [])), tuple(fact.get("account_names", [])), tuple(fact.get("cash_values", [])),
                        fact.get("relationship"))
@@ -521,9 +564,9 @@ def retention_issues(document, notes, comments):
         related = " ".join(_plain(b.get("text", "")) for b in bullets
                            if set(requirement["related_source_ids"]) & set(b.get("source_ids", [])))
         if kind == "spend_qualification":
-            mentioned = _BENEFITS[requirement["benefit"]].search(related)
-            if requirement["benefit"] == "credit or bonus" and _bonus_alias(requirement):
-                mentioned = re.search(r"\bbonus\b", related, re.I) or _BENEFITS["welcome bonus"].search(related)
+            # The writer may cite the explicitly selected parent rather than
+            # its reply. Both are bound evidence for this same condition.
+            mentioned = _benefit_mentioned(" ".join([related, cited]), requirement)
             if not mentioned:
                 continue  # Omitting the benefit claim does not imply it is unconditional.
             retained = any(fact["amount"] == requirement["amount"] and _same_qualifying_benefit(fact, requirement)
