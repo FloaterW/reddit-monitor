@@ -266,11 +266,145 @@ def manufactured_spending_signal(body):
     return bool((explicit or shorthand) and concrete)
 
 
+_DIRECT_DEPOSIT = re.compile(r"(?i:\bdirect[- ]deposits?\b)|\bDDs?\b")
+_BONUS_PAYOUT = re.compile(r"\b(?:bonus|bonuses|payout)\b", re.I)
+_UNCERTAIN_CONDITION = re.compile(r"\b(?:unclear|unknown|unspecified|whether|maybe|perhaps|might|could|not sure|not established|not stated|not reported|does not establish|check|verify)\b", re.I)
+
+
+def _cash_values(text):
+    return {_number(m.group()) for m in re.finditer(rf"(?<!\w){_NUMBER}(?!\w)", text)
+            if "$" in m.group() or m.group().lower().endswith("k")}
+
+
+def _account_names(text):
+    return {m.group(1).casefold() for m in re.finditer(
+        r"\b([A-Z][A-Za-z0-9]+)\s+(?:Checking|checking|Savings|savings)\b", text)}
+
+
+def _direct_deposit_facts(text, *, bonus_context=False):
+    """Preserve an explicit DD requirement or reported payout path, not bank policy."""
+    facts = []
+    for sentence in _sentences(text):
+        if sentence.endswith("?"):
+            continue
+        for clause in re.split(r";|\b(?:but|whereas|while)\b", sentence, flags=re.I):
+            if _UNCERTAIN_CONDITION.search(clause):
+                continue
+            deposit, bonus = _DIRECT_DEPOSIT.search(clause), _BONUS_PAYOUT.search(clause) or bonus_context
+            if not deposit or not bonus:
+                continue
+            prefix = " ".join(clause[:deposit.start()].split()[-4:])
+            if (_NEGATION.search(prefix) or re.search(r"\bbefore\b", prefix, re.I)
+                    or re.match(r"\s+(?:(?:is|was|are|were)\s+)?not\s+(?:required|needed|necessary)", clause[deposit.end():], re.I)):
+                continue
+            if not re.search(r"\b(?:requires?|required|needs?|after|following|followed|once|upon|within|until|when|met|meeting|qualifying)\b", clause, re.I):
+                continue
+            required = bool(re.search(r"\b(?:requires?|needs?)\s+(?:a\s+|qualifying\s+)?(?:direct[- ]deposits?|DDs?)\b|"
+                                      r"\b(?:direct[- ]deposits?|DDs?)\s+(?:(?:is|are)\s+)?required\b", clause, re.I))
+            facts.append({"relationship": "required" if required else "reported_payout_path",
+                          "cash_values": sorted(_cash_values(clause)), "account_names": sorted(_account_names(clause)),
+                          "evidence": clause[:1200]})
+    return facts
+
+
+def _ordinary_transfer_statements(text, *, include_uncertain=False):
+    # Both "qualifies" and "does not qualify" would overstate an unspecified
+    # funding source. A question or explicit uncertainty makes no such claim.
+    return [sentence for sentence in _sentences(text)
+            if (include_uncertain or (not sentence.endswith("?") and not _UNCERTAIN_CONDITION.search(sentence)))
+            and re.search(r"\b(?:ordinary|regular|external|ACH|bank)\s+(?:bank\s+)?transfers?\b", sentence, re.I)
+            and re.search(r"\b(?:qualif\w*|counts?|suffic\w*|satisf\w*|meets?|works?|eligible)\b", sentence, re.I)]
+
+
+def _ordinary_transfer_claim(text):
+    return bool(_ordinary_transfer_statements(text))
+
+
+def _clause_key(text):
+    return " ".join(re.findall(r"\w+", _plain(text).casefold()))
+
+
+def _selected_deposit_facts(source_facts, note_facts):
+    """Choose only unique source clauses; missing anchors are not a wildcard."""
+    selected = []
+    for note in note_facts:
+        exact = [fact for fact in source_facts if _clause_key(fact["evidence"]) == _clause_key(note["evidence"])]
+        matches = exact or [fact for fact in source_facts
+                            if fact["account_names"] and note["account_names"]
+                            and set(fact["account_names"]) & set(note["account_names"])
+                            and (not fact["cash_values"] or not note["cash_values"]
+                                 or set(fact["cash_values"]) & set(note["cash_values"]))]
+        if len(matches) > 1:
+            matches = [fact for fact in matches if fact["relationship"] == note["relationship"]]
+        if len(matches) == 1 and matches[0] not in selected:
+            selected.append(matches[0])
+    return selected
+
+
+def _associated_transfer_statements(body, fact):
+    """An immediate 'this bonus' statement can qualify the preceding DD report."""
+    direct = _ordinary_transfer_statements(fact["evidence"])
+    if direct:
+        return direct
+    sentences = _sentences(body)
+    for index, sentence in enumerate(sentences[:-1]):
+        if _clause_key(fact["evidence"]) not in _clause_key(sentence):
+            continue
+        following = sentences[index+1]
+        if _ordinary_transfer_claim(following) and re.fullmatch(
+                r"(?:ordinary|regular|external|ACH|bank)\s+(?:bank\s+)?transfers?\s+"
+                r"(?:(?:also|do|does|not|don't|can|will)\s+)*(?:qualify|count|work|suffice|are eligible)\s+"
+                r"(?:for|towards?)\s+(?:this|that|the same)\s+(?:bonus|payout|offer)"
+                r"(?:\s+(?:only|if|when|after|provided|subject to|unless)\b[^.!?]*)?[.!]?", following, re.I):
+            return [following]
+    return []
+
+
+_INK_VARIANT_GROUP = re.compile(
+    r"\b(?:Chase\s+)?Ink\s+(?:Business\s+)?(?:Cash|Unlimited|Preferred)"
+    r"(?:\s*(?:,\s*)?(?:and|&|/)\s*(?:(?:Chase\s+)?Ink\s+(?:Business\s+)?)?(?:Cash|Unlimited|Preferred))+\b|"
+    r"\b(?:CIC|CIU|CIP)(?:\s*(?:,\s*)?(?:and|&|/)\s*(?:CIC|CIU|CIP))+\b", re.I)
+_REWARD_AMOUNT = re.compile(rf"({_NUMBER})\s*(?:cash\s*back|back|points?|miles|bonus|offers?|SUB)\b", re.I)
+
+
+def _shared_offer_facts(text):
+    """Only explicitly coordinated Ink variants sharing one adjacent offer."""
+    names = {"cash": "Ink Cash", "cic": "Ink Cash", "unlimited": "Ink Unlimited",
+             "ciu": "Ink Unlimited", "preferred": "Ink Preferred", "cip": "Ink Preferred"}
+    facts = []
+    for sentence in _sentences(text):
+        if sentence.endswith("?"):
+            continue
+        for clause in re.split(r";|\b(?:but|whereas|while)\b", sentence, flags=re.I):
+            if _UNCERTAIN_CONDITION.search(clause):
+                continue
+            for group in _INK_VARIANT_GROUP.finditer(clause):
+                if _NEGATION.search(" ".join(clause[:group.start()].split()[-4:])):
+                    continue
+                cards = sorted({names[token.casefold()] for token in re.findall(r"\b(?:Cash|CIC|Unlimited|CIU|Preferred|CIP)\b", group.group(), re.I)})
+                if len(cards) < 2:
+                    continue
+                for reward in _REWARD_AMOUNT.finditer(clause):
+                    if reward.start() >= group.end():
+                        bridge = clause[group.end():reward.start()].strip(" :,-")
+                        allowed = r"(?:both|each|also|have|has|had|show|shows|offer|offers|offering|a|an|the|same|targeted|in-app|welcome|new|for|of|at|with|is|are|was|were|currently|now|earn)"
+                    elif reward.end() <= group.start():
+                        bridge = clause[reward.end():group.start()].strip(" :,-")
+                        allowed = r"(?:offer|offers|bonus|bonuses|on|for|both|each|the|same|across|of|these|cards)"
+                    else:
+                        continue
+                    if len(bridge) > 70 or (bridge and not re.fullmatch(rf"{allowed}(?:\s+{allowed})*", bridge, re.I)):
+                        continue
+                    facts.append({"cards": cards, "amount": _number(reward.group(1)),
+                                  "source_amount": reward.group(1), "evidence": clause[:1200]})
+    return facts
+
+
 def selected_note_requirements(notes, comments):
     """Protect narrow material facts only for sources attached to selected notes."""
     by_id = {row.get("id"): row for row in comments if isinstance(row.get("id"), str)}
     requirements = []
-    seen = set()
+    seen = {}
     for note in notes:
         # The planner may retain a clarification as its own note. Tie its
         # condition to the shared story, never to unrelated notes in the batch.
@@ -284,6 +418,30 @@ def selected_note_requirements(notes, comments):
                 continue
             body = _plain(source.get("body", ""))
             facts = []
+            # These facts must survive extraction AND be selected. An omitted
+            # prior condition or another product mention is not a new mandate.
+            selected_text = " ".join(_plain(other.get("text", "")) for other in group if sid in other.get("source_ids", []))
+            deposit_notes, shared_notes = _direct_deposit_facts(selected_text), _shared_offer_facts(selected_text)
+            # A selected reply may explicitly retain an offer from its supplied
+            # parent. Preserve that selected fact, without promoting other old
+            # parent material or an independently excluded extraction note.
+            for evidence in [source, *[p for p in source.get("parent_context", []) if isinstance(p, dict)]]:
+                evidence_id = evidence.get("id")
+                if not isinstance(evidence_id, str):
+                    continue
+                evidence_body = _plain(evidence.get("body", ""))
+                binding = {"evidence_source_id": evidence_id, "evidence_source_ids": list(dict.fromkeys([evidence_id, sid]))}
+                # Funding-path protection is intentionally limited to the
+                # selected source itself; an older parent's condition must not
+                # become a fresh requirement for a later payout report.
+                deposit_sources = _direct_deposit_facts(evidence_body) if evidence_id == sid else []
+                for fact in _selected_deposit_facts(deposit_sources, deposit_notes):
+                    facts.append({"kind": "direct_deposit", **fact, **binding,
+                                  "source_deposit_fact_count": len(deposit_sources),
+                                  "transfer_qualification_statements": _associated_transfer_statements(evidence_body, fact)})
+                for fact in _shared_offer_facts(evidence_body):
+                    if any(fact["cards"] == n["cards"] and fact["amount"] == n["amount"] for n in shared_notes):
+                        facts.append({"kind": "shared_offer_variants", **fact, **binding})
             for fact in _qualification_facts(body):
                 if _BENEFITS[fact["benefit"]].search(note_text):
                     facts.append({"kind": "spend_qualification", **fact})
@@ -297,12 +455,20 @@ def selected_note_requirements(notes, comments):
                     if not fact["quantities"] or any(value in {_number(m.group()) for m in re.finditer(rf"(?<!\w){_NUMBER}(?!\w)", note_text)} for value in fact["quantities"]):
                         facts.append({"kind": "event_age", **fact})
             for fact in facts:
-                key = (sid, fact["kind"], fact.get("amount"), fact.get("benefit"),
-                       tuple(fact.get("destination_terms", [])), fact.get("event_age"))
+                evidence_id = fact.get("evidence_source_id", sid)
+                key = (evidence_id, fact["kind"], fact.get("amount"), fact.get("benefit"),
+                       tuple(fact.get("destination_terms", [])), fact.get("event_age"),
+                       tuple(fact.get("cards", [])), tuple(fact.get("account_names", [])), tuple(fact.get("cash_values", [])),
+                       fact.get("relationship"))
                 if key in seen:
+                    if fact.get("evidence_source_ids"):
+                        previous = seen[key]
+                        previous["evidence_source_ids"] = list(dict.fromkeys(
+                            [*previous.get("evidence_source_ids", []), *fact["evidence_source_ids"]]))
                     continue
-                seen.add(key)
-                requirements.append({"source_id": sid, "related_source_ids": related, **fact})
+                requirement = {"source_id": evidence_id, "related_source_ids": related, **fact}
+                seen[key] = requirement
+                requirements.append(requirement)
     return requirements
 
 
@@ -349,7 +515,8 @@ def retention_issues(document, notes, comments):
     issues = []
     for requirement in requirements:
         sid, kind = requirement["source_id"], requirement["kind"]
-        source_bullets = [_plain(b.get("text", "")) for b in bullets if sid in b.get("source_ids", [])]
+        evidence_ids = set(requirement.get("evidence_source_ids", [sid]))
+        source_bullets = [_plain(b.get("text", "")) for b in bullets if evidence_ids & set(b.get("source_ids", []))]
         cited = " ".join(source_bullets)
         related = " ".join(_plain(b.get("text", "")) for b in bullets
                            if set(requirement["related_source_ids"]) & set(b.get("source_ids", [])))
@@ -380,4 +547,71 @@ def retention_issues(document, notes, comments):
         elif kind == "event_age":
             if re.search(r"\b(?:offer|bonus|promotion|SUB)\b", cited, re.I) and not _has_age(cited):
                 issues.append(f"Preserve {sid}'s reported offer age ({requirement['event_age']}) or explicitly label it historical; do not present an older offer sighting as current availability.")
+        elif kind == "direct_deposit":
+            names = requirement["account_names"]
+            claims = []
+            for section in document.get("sections", []):
+                if not isinstance(section, dict):
+                    continue
+                text = " ".join(_plain(b.get("text", "")) for b in section.get("bullets", [])
+                                if isinstance(b, dict) and evidence_ids & set(b.get("source_ids", [])))
+                if not text:
+                    continue
+                heading = _plain(section.get("title", ""))
+                account_names = _account_names(text) or _account_names(heading)
+                if names and account_names and not set(names) & account_names:
+                    continue
+                # A heading supplies claim TYPE only for its own cited bullet.
+                # It cannot supply the missing DD evidence or rescue a claim in
+                # a separate section. Incidental outgoing-transfer prose is not
+                # a payout claim merely because a broad heading mentions bonuses.
+                heading_claim = _BONUS_PAYOUT.search(heading) and re.search(
+                    r"\b(?:paid|pays?|receiv\w*|arriv\w*|credited|posted|earned|earns?|requires?|required|qualifying|eligible)\b", text, re.I)
+                if _BONUS_PAYOUT.search(text) or heading_claim:
+                    claims.append((text, heading))
+            retained, checked_claims = True, []
+            for text, heading in claims:
+                facts = [fact for fact in _direct_deposit_facts(text, bonus_context=True)
+                         if not names or not fact["account_names"] or set(names) & set(fact["account_names"])]
+                if requirement.get("source_deposit_fact_count", 1) > 1:
+                    # A multi-account source cannot supply unqualified context
+                    # to every same-citation payout. With no explicit account
+                    # match, only the exact selected clause is safely bound.
+                    bound = [fact for fact in facts
+                             if (names and fact["account_names"] and set(names) & set(fact["account_names"]))
+                             or _clause_key(fact["evidence"]) == _clause_key(requirement["evidence"])]
+                    if not bound:
+                        continue
+                    facts = bound
+                checked_claims.append(text)
+                kept = any(fact["relationship"] == requirement["relationship"] for fact in facts)
+                if requirement["relationship"] == "reported_payout_path":
+                    # Observing DD before payout does not establish a universal
+                    # eligibility rule, even if the inferred rule is plausible.
+                    kept = kept and not any(fact["relationship"] == "required"
+                                            for fact in [*facts, *_direct_deposit_facts(heading)])
+                retained = retained and kept
+            if claims and not retained:
+                issues.append(f"Preserve {sid}'s direct-deposit qualification/reported payout path with its bonus claim and source citation. Keep this a reported funding path unless the source explicitly states a requirement; do not imply an ordinary transfer qualifies.")
+            supplied = requirement["transfer_qualification_statements"]
+            if supplied:
+                supplied_keys = {_clause_key(statement) for statement in supplied}
+                if any(_clause_key(statement) not in supplied_keys for text in checked_claims
+                       for statement in _ordinary_transfer_statements(text, include_uncertain=True)):
+                    issues.append(f"Preserve {sid}'s explicit associated transfer-eligibility statement without changing its direction or conditions. The rendered eligibility claim does not match the supplied source clause.")
+            elif any(_ordinary_transfer_claim(text) for text in checked_claims):
+                issues.append(f"Do not infer whether ordinary bank transfers qualify for {sid}'s bonus. The selected source reports direct deposits without establishing transfer eligibility.")
+        elif kind == "shared_offer_variants":
+            from editorial_selection import CARD_PATTERNS
+            matching_claim = any(
+                any(re.search(CARD_PATTERNS[card], clause, re.I) for card in requirement["cards"])
+                and any(_number(m.group(1)) == requirement["amount"] for m in _REWARD_AMOUNT.finditer(clause))
+                for sentence in _sentences(cited)
+                for clause in re.split(r";|\b(?:but|whereas|while)\b", sentence, flags=re.I))
+            if not matching_claim:
+                continue  # Do not require card mentions when the offer itself is omitted.
+            retained = any(fact["cards"] == requirement["cards"] and fact["amount"] == requirement["amount"]
+                           for fact in _shared_offer_facts(cited))
+            if not retained:
+                issues.append(f"Preserve all explicitly selected variants ({', '.join(requirement['cards'])}) for {sid}'s shared {requirement['source_amount']} reported offer, with that citation. Do not turn a preapproval banner or question into an actual approval.")
     return issues

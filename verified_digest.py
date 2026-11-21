@@ -10,7 +10,15 @@ from datetime import datetime
 from pathlib import Path
 
 from editorial_checks import editorial_issues
-from editorial_novelty import novelty_issues, repeat_fact_context, repeated_background
+from editorial_novelty import (
+    novelty_issues,
+    repeat_fact_context,
+    repeated_background,
+    same_edition_issues,
+    same_edition_repeats,
+    scoped_repeat_repair_issues,
+    shared_fact_retention_issues,
+)
 from editorial_profiles import resolve_editorial
 from editorial_retention import identify_candidates, retention_issues, selected_note_requirements
 from editorial_selection import (
@@ -490,6 +498,14 @@ def summarize_verified(comments, chunker, invoke, artifact_dir=None, recovered_n
     phase("writing")
     repeated_facts = repeat_fact_context(plan, payload if plan else None, recent_editions)
     novelty_attempts = []
+    shared_source_attempts = []
+
+    def save_novelty_progress():
+        if artifact_dir is not None:
+            from daily_digest import atomic_write_json
+            atomic_write_json(Path(artifact_dir) / "novelty-review.json", {
+                "completed": False, "known_repeat_facts": len(repeated_facts),
+                "repair_attempts": novelty_attempts, "same_edition_attempts": shared_source_attempts})
 
     def write_batch(batch):
         referenced = {i for note in batch for i in note["source_ids"]}
@@ -604,11 +620,7 @@ def summarize_verified(comments, chunker, invoke, artifact_dir=None, recovered_n
             sections = [section for part in executor.map(write_batch, batches) for section in part]
     finally:
         save_budget()
-        if artifact_dir is not None:
-            from daily_digest import atomic_write_json
-            atomic_write_json(Path(artifact_dir) / "novelty-review.json", {
-                "completed": False, "known_repeat_facts": len(repeated_facts),
-                "repair_attempts": novelty_attempts})
+        save_novelty_progress()
     merged = {}
     seen_groups = set()
     for section in sections:
@@ -629,22 +641,88 @@ def summarize_verified(comments, chunker, invoke, artifact_dir=None, recovered_n
             merged[key]["bullets"].extend(group)
             seen_groups.add(fingerprint)
     document = {"sections": [s for s in merged.values() if s["bullets"]]}
-    result, errors = render_checked(document, comments, minimum_sections=1 if profile.preset == "churning" else None,
+    selected_notes = [n for batch in batches for n in batch]
+
+    def validate_merged(draft):
+        rendered, issues = render_checked(draft, comments, minimum_sections=1 if profile.preset == "churning" else None,
                                     financial_checks=profile.financial_checks,
                                     factual_checks=profile.preset == "churning",
                                     edition_cutoff=edition_cutoff, digest_date=edition_date)
-    report = selection_report(document, leads, plan, len(recent_editions), comments=comments)
-    errors.extend(report["issues"])
-    if profile.preset == "churning":
-        errors.extend(retention_issues(document, [n for batch in batches for n in batch], comments))
+        report = selection_report(draft, leads, plan, len(recent_editions), comments=comments)
+        issues.extend(report["issues"])
+        if profile.preset == "churning":
+            issues.extend(retention_issues(draft, selected_notes, comments))
+        issues.extend(novelty_issues(draft, repeated_facts))
+        issues.extend(same_edition_issues(draft))
+        return rendered, issues, report
+
+    result, errors, report = validate_merged(document)
+    cross_part = same_edition_repeats(document)
+    if cross_part:
+        original_document = json.loads(json.dumps(document))
+        # Parts are written independently. Only duplicated later sections may
+        # be corrected here; the original occurrence and every other section
+        # remain byte-for-byte intact. All ordinary full-document gates rerun.
+        affected = sorted({finding["section_index"] for finding in cross_part})
+        references = {source_id for index in affected for bullet in document["sections"][index]["bullets"]
+                      for source_id in bullet["source_ids"]}
+        evidence = _source_records([c for c in comments if c.get("id") in references])
+        scoped_notes = [note for note in selected_notes if set(note["source_ids"]) & references]
+        fixed_titles = [document["sections"][index]["title"] for index in affected]
+        retained = [{"section_index": index, "section": document["sections"][index]}
+                    for index in sorted({f["repeated_from_section"] for f in cross_part} - set(affected))]
+        prompt = (profile.rules + SOURCE_TIME_RULES + edition_context + profile.style + profile.writing
+                  + json.dumps(scoped_notes, ensure_ascii=False) + "\nORIGINAL SOURCES:\n"
+                  + json.dumps(evidence, ensure_ascii=False)
+                  + "\nSCOPED SAME-EDITION REPAIR:\n"
+                  + "The newsletter repeats a shared-source numeric fact under multiple headings. Return ONLY the "
+                  "provided affected sections, in exactly the same order with exactly the same titles. Remove only "
+                  "the redundant clause; retain other information, source IDs, outcomes, qualifications and selected "
+                  "material details. Preserve all unaffected bullets exactly. The earlier occurrence is retained "
+                  "outside this response; do not copy it back into another story. Read-only earlier sections:\n"
+                  + json.dumps(retained, ensure_ascii=False)
+                  + "\nORIGINAL AFFECTED SECTIONS (immutable baseline):\n"
+                  + json.dumps({"sections": [original_document["sections"][index] for index in affected]}, ensure_ascii=False)
+                  + "\nFor a mixed bullet, remove only the flagged sentence/clause and keep every other clause verbatim. "
+                    "Keep its source IDs and indentation. If deleting its first clause leaves a complete sentence "
+                    "after a leading source, you may move source_position from start to end; do not change its text. "
+                    "Do not rewrite, omit, move or add any unaffected bullet.")
+        try:
+            for attempt in range(2):
+                shared_source_attempts.append({"phase": "merged", "attempt": attempt + 1,
+                    "findings": same_edition_repeats(document), "affected_sections": affected})
+                scoped = {"sections": [document["sections"][index] for index in affected]}
+                repair = call(prompt + f"\nScoped correction attempt {attempt + 1} of 2. "
+                              + ("The previous correction still failed; resolve the remaining issues without removing retained facts.\n" if attempt else "\n")
+                              + "\nAFFECTED DRAFT:\n" + json.dumps(scoped, ensure_ascii=False)
+                              + "\nFULL-NEWSLETTER VALIDATION ISSUES (section numbers refer to the full newsletter):\n"
+                              + json.dumps(errors, ensure_ascii=False), min(AI_SYNTHESIS_TIMEOUT, 240))
+                if (not _safe_auxiliary_shape(repair)
+                        or [section.get("title") for section in repair["sections"]] != fixed_titles):
+                    errors = ["Return exactly the affected sections in the original order, with unchanged titles and valid source-ID lists."]
+                    continue
+                candidate = {"sections": list(document["sections"])}
+                for index, section in zip(affected, repair["sections"]):
+                    candidate["sections"][index] = section
+                document = candidate
+                result, errors, report = validate_merged(document)
+                errors.extend(scoped_repeat_repair_issues(original_document, document, cross_part))
+                errors.extend(shared_fact_retention_issues(document, cross_part))
+                if not errors:
+                    break
+        finally:
+            save_budget()
+            save_novelty_progress()
     final_novelty = repeated_background(document, repeated_facts)
-    errors.extend(novelty_issues(document, repeated_facts))
+    final_shared = same_edition_repeats(document)
     report["novelty_review"] = {
         "completed": True,
         "enabled": bool(repeated_facts), "known_repeat_facts": len(repeated_facts),
         "repair_checks_triggered": len(novelty_attempts), "remaining_repeated_clauses": len(final_novelty),
         "findings": final_novelty,
-        "meaning": "Conservative numeric-clause overlap with planner repeats and prior full stories; not exhaustive semantic novelty detection. No automatic source or bullet deletion.",
+        "same_edition_repair_checks": len(shared_source_attempts),
+        "remaining_same_edition_clauses": len(final_shared), "same_edition_findings": final_shared,
+        "meaning": "Conservative numeric-clause overlap with planner repeats and prior full stories, plus strong same-source repeats across distinct current sections; not exhaustive semantic novelty detection. No automatic source or bullet deletion.",
     }
     trace = build_source_trace(comments, notes, document, plan=plan,
                                payload=payload if plan else None, review=review)
@@ -659,7 +737,8 @@ def summarize_verified(comments, chunker, invoke, artifact_dir=None, recovered_n
         from daily_digest import atomic_write_json
         atomic_write_json(Path(artifact_dir) / "source-selection.json", trace)
         atomic_write_json(Path(artifact_dir) / "novelty-review.json", {
-            **report["novelty_review"], "repair_attempts": novelty_attempts})
+            **report["novelty_review"], "repair_attempts": novelty_attempts,
+            "same_edition_attempts": shared_source_attempts})
     if editorial_report is not None:
         editorial_report.update(report)
     if errors:

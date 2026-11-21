@@ -43,6 +43,9 @@ selection step. General-purpose profiles retain their existing pipeline.
    cycle; the checker never deletes a bullet automatically. Changed amounts,
    outcomes, deadlines, offer channels, eligibility or ambiguous scope are
    conservatively preserved. Remaining validation failures stop delivery.
+   A separate check catches strong same-source numeric repeats across different
+   sections of the current edition. Its bounded correction preserves the first
+   supported occurrence and freezes unrelated bullets, attribution and sections.
 
 Material-retention checks bind qualifying spending, contrasted product-change
 outcomes, rewards non-conversion and older offer age to their actual source and
@@ -58,6 +61,13 @@ alone met a spending threshold. Known issuer/card names present only in a thread
 title must be framed as discussion context or omitted, not asserted as the reply's
 verified product identity. These checks cover explicit patterns and aliases;
 they are not a general semantic fact checker.
+
+Selected bank-bonus reports retain explicit direct-deposit requirements or the
+reported direct-deposit payout path. A reported funding path does not establish
+bank policy or whether other transfers qualify. A shared quantified Ink offer
+retains all explicitly selected card variants supported by its cited source or
+supplied parent; unrelated card mentions and omitted historical offers do not
+become mandatory details.
 
 Reported offers are not verified public terms. Questions stay questions;
 preapproval marketing is not an application outcome or a paid bonus. When
