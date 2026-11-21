@@ -210,7 +210,8 @@ def test_arithmetic_failure_blocks_email_in_strict_mode(tmp_path):
     raw.write_text(json.dumps([{**row(), "body": claim}]))
     text = "# Digest\n\n- " + claim + " [u/a_user](https://reddit.com/r/test/comments/p/topic/a/)\n"
     with patch.object(digest, "summarize", return_value=text), patch.object(digest, "send_email") as send:
-        assert digest.main(["--from-json", str(raw), "--no-db", "--source-safe", "--quality", "strict",
+        assert digest.main(["--from-json", str(raw), "--digest-date", "2026-09-18",
+                            "--no-db", "--source-safe", "--quality", "strict",
                             "--save", str(tmp_path / "digest.md"), "--status-file", str(tmp_path / "status.json"),
                             "--quiet-summary"]) == 3
     send.assert_not_called()

@@ -45,6 +45,7 @@ def _summary(amount="50"):
 def _run_args(tmp_path, raw_path, *extra):
     return [
         "--from-json", str(raw_path),
+        "--digest-date", "2026-09-02",
         "--save", str(tmp_path / "digest.md"),
         "--save-raw", str(tmp_path / "raw-copy.json"),
         "--db", str(tmp_path / "monitor.db"),
@@ -120,20 +121,21 @@ class TestDigestRunLifecycle:
         assert status["quality_status"] == "failed"
         assert status["email_status"] == "blocked_by_quality_gate"
 
-    def test_email_failure_is_a_failed_run(self, tmp_path):
+    @pytest.mark.parametrize("delivery_status", ["failed", "skipped", None])
+    def test_email_failure_is_a_failed_run(self, tmp_path, delivery_status):
         raw_path = tmp_path / "source.json"
         raw_path.write_text(json.dumps([_comment()]), encoding="utf-8")
 
         with (
             patch("daily_digest.summarize", return_value=_summary()),
-            patch("daily_digest.send_email", return_value="failed"),
+            patch("daily_digest.send_email", return_value=delivery_status),
         ):
             exit_code = main(_run_args(tmp_path, raw_path, "--quality", "off"))
 
-        assert exit_code == 4
+        assert exit_code == (5 if delivery_status is None else 4)
         status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
         assert status["status"] == "failed"
-        assert status["email_status"] == "failed"
+        assert status["email_status"] == ("uncertain" if delivery_status is None else delivery_status)
         db = DigestDB(tmp_path / "monitor.db")
         assert db.get_runs()[0]["status"] == "failed"
         db.close()

@@ -83,7 +83,8 @@ class TestTimeAll:
             result = scrape_all(["chase"], ["test"], 1, "all", stats=stats)
 
         assert len(result) == 1
-        assert stats == {"raw_comment_count": 2, "matched_comment_count": 1}
+        assert stats == {"raw_comment_count": 2, "matched_comment_count": 1,
+                         "collector": "legacy"}
 
 
 class TestRSSFallback:

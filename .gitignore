@@ -25,6 +25,9 @@ deep_*.json
 digest_*.md
 digest_*.json
 digest_*.work/
+*.collection-audit.json
+*.recovery.json
+.delivery-receipts/
 
 # SQLite database
 data/

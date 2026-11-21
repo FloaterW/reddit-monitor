@@ -122,16 +122,8 @@ _BASE = "https://old.reddit.com"
 
 
 def _parse_retry_after(value, default=60):
-    """Parse a Retry-After header value into seconds.
-
-    Reddit sends integer seconds, but the HTTP spec also allows an HTTP-date.
-    Non-numeric values fall back to the default instead of crashing the run.
-    """
-    try:
-        seconds = int(value)
-    except (TypeError, ValueError):
-        return default
-    return min(max(seconds, 0), 120)
+    """Preserve the full server cooldown; the request budget bounds the wait."""
+    return _rss_retry_delay(value, default)
 
 
 def _fetch(path, params=None):
@@ -151,6 +143,14 @@ def _fetch(path, params=None):
 
         if resp.status_code == 429:
             wait = _parse_retry_after(resp.headers.get("Retry-After"))
+            if attempt == 2:
+                break
+            # Standalone scraper commands do not have a collection deadline.
+            # Skip a long cooldown instead of retrying before Reddit permits it
+            # or allowing an arbitrarily large header to keep the CLI asleep.
+            if _REQUEST_DEADLINE.get() is None and wait > 120:
+                print("  WARNING: Reddit cooldown exceeds the retry wait limit — skipping this request.")
+                return None
             print(f"  Rate limited - waiting {wait}s...")
             _retry_sleep(wait)
             continue
@@ -668,6 +668,14 @@ _RSS_SESSION.headers.update({
 })
 
 
+def _rss_request_failed(path, reason):
+    """Keep actionable transport errors without recording response bodies or secrets."""
+    match = re.match(r"^/r/([A-Za-z0-9_]+)(?:/|$)", path)
+    subreddit = match.group(1) if match else ""
+    collection_warning(subreddit, f"RSS request failed: {reason}; coverage is incomplete.")
+    return None
+
+
 def _fetch_rss(path, params=None):
     """Fetch an RSS/Atom feed and return the XML root element, or None."""
     url = f"{_RSS_BASE}{path}"
@@ -679,13 +687,14 @@ def _fetch_rss(path, params=None):
                 _retry_sleep(wait)
         try:
             resp = _RSS_SESSION.get(url, params=params, timeout=_request_timeout())
-        except (requests.ConnectionError, requests.Timeout):
+        except (requests.ConnectionError, requests.Timeout) as exc:
             if pacing:
                 pacing["successes"] = 0
             if attempt < 2:
                 _retry_sleep(3 * (attempt + 1))
                 continue
-            return None
+            reason = "request timed out" if isinstance(exc, requests.Timeout) else "connection failed"
+            return _rss_request_failed(path, reason + " after 3 attempts")
 
         if pacing:
             pacing["next"] = time.monotonic() + pacing["interval"]
@@ -698,22 +707,35 @@ def _fetch_rss(path, params=None):
                 pacing["next"] = time.monotonic() + max(wait, pacing["interval"])
             if attempt == 2:
                 # Do not spend the remaining budget sleeping without a retry.
-                return None
+                return _rss_request_failed(path, "HTTP 429 rate limit after 3 attempts")
             print(f"    RSS rate limited — waiting {wait}s...")
             if not pacing:
+                if _REQUEST_DEADLINE.get() is None and wait > 120:
+                    return _rss_request_failed(path, "HTTP 429 cooldown exceeds the standalone wait limit")
                 _retry_sleep(wait)
             continue
         if resp.status_code != 200:
             if pacing:
                 pacing["successes"] = 0
-            return None
+            reason = f"HTTP {resp.status_code}"
+            if resp.status_code in (404, 410):
+                reason += (
+                    "; feed unavailable. Reddit announced RSS retirement for "
+                    "2026-11-13; see docs/COLLECTION_ACCESS.md"
+                )
+            return _rss_request_failed(path, reason)
 
         try:
             root = ET.fromstring(resp.content)
         except ET.ParseError:
             if pacing:
                 pacing["successes"] = 0
-            return None
+            return _rss_request_failed(path, "response was not valid XML")
+
+        if root.tag != f"{{{_RSS_NS['atom']}}}feed":
+            if pacing:
+                pacing["successes"] = 0
+            return _rss_request_failed(path, "response was not an Atom feed")
 
         if pacing:
             pacing["successes"] = pacing.get("successes", 0) + 1

@@ -64,7 +64,7 @@ Without `--monitor`, standalone evaluation retains its historical financial-chec
 
 ## Compatibility
 
-- The `churning` monitor explicitly selects its preset and financial checks. The refactor preserves its previous prompts byte-for-byte, its collection settings, and its existing Windows wrappers.
+- The `churning` monitor explicitly selects its preset and financial checks. Its established writing/style and source-safety rules remain in place. Extraction priorities and global story planning have since evolved to protect material offers and application outcomes and reduce repeated coverage; see [editorial selection](EDITORIAL_SELECTION.md). Collection settings and Windows wrappers remain separate from editorial configuration.
 - `job-market` now has its own audience, priorities, and style for both summarization paths.
 - Other monitor profiles that omit `digest.editorial` use the general preset.
 - No-profile/no-topic-override CLI calls keep historical churning defaults. Explicit `--subreddits` or `--keywords` without a monitor selects general editorial behavior; specify both when you want to replace both legacy collection defaults.

@@ -1,5 +1,5 @@
--r requirements.txt
+# Full development environment including security auditing requires Python 3.11+.
+-r requirements-test.txt
 pip-audit>=2.9,<3
-pytest>=8,<10
-pytest-cov>=6,<8
-ruff>=0.7,<1
+filelock>=4.2.1,<5
+msgpack>=1.2.3,<2

@@ -61,6 +61,7 @@ def test_smtp_verifies_certificate_before_authentication(
     "gmail_app_password.backup", "private.pem", "private.key", "private.p12",
     "private.pfx", "monitor.db", "monitor.db-wal", "monitor.sqlite3",
     "data/report.json", "digest_20260101_1830.work/draft.json",
+    "newsletter.recovery.json", ".delivery-receipts/receipt.json", "custom/.delivery-receipts/receipt.json",
     "digest_20260101_1830.json", "digest_20260101_1830.md", "digest_run.log",
     ".planning/debug/private.md", ".codex/config.toml", ".agents/local.md",
 ])

@@ -97,6 +97,9 @@ def _normalize_reddit_url(value):
 
 
 def _comment_url_key(comment):
+    if comment.get("source_kind"):
+        from source_records import source_url_key
+        return source_url_key(comment)
     direct = comment.get("comment_permalink") or comment.get("permalink")
     if direct:
         normalized = _normalize_reddit_url(direct)
@@ -305,10 +308,19 @@ def check_completeness(digest_text, comments, top_fraction=0.25):
 
     Returns dict with covered/missing high-signal comments and pass/fail.
     """
-    if not comments:
-        return {"top_count": 0, "covered": [], "missing": [], "passed": True}
+    # Public RSS rows have no vote scores (stored as zero). Arbitrarily ranking
+    # tied zero rows describes input order, not the important news we covered.
+    valid_scores = [c.get("score") for c in comments
+                    if isinstance(c.get("score"), (int, float)) and not isinstance(c.get("score"), bool)]
+    if not comments or not valid_scores or all(score == 0 for score in valid_scores):
+        return {"top_count": 0, "covered_count": 0, "missing_count": 0,
+                "covered": [], "missing": [], "passed": True, "required": False,
+                "available": False,
+                "note": "Score-based completeness is unavailable: no source comments." if not comments else
+                        "Score-based completeness is unavailable: source vote scores are absent or all zero; input order is not a news-importance ranking."}
 
-    scored = sorted(comments, key=lambda c: c.get("score", 0), reverse=True)
+    scored = sorted(comments, key=lambda c: c.get("score", 0)
+                    if isinstance(c.get("score"), (int, float)) else 0, reverse=True)
     cutoff_idx = max(1, int(len(scored) * top_fraction))
     top_comments = scored[:cutoff_idx]
 
@@ -340,6 +352,7 @@ def check_completeness(digest_text, comments, top_fraction=0.25):
         "missing_count": len(missing),
         "covered": covered,
         "missing": missing,
+        "available": True,
         "passed": len(missing) == 0,
     }
 
@@ -444,8 +457,11 @@ def format_report(results):
 
     comp = results["completeness"]
     status = "INFO" if not comp.get("required", True) else ("PASS" if comp["passed"] else "FAIL")
-    lines.append(f"Completeness [{status}]: {comp['covered_count']}/{comp['top_count']}"
-                 f" top-scored comments represented")
+    if comp.get("available", True):
+        lines.append(f"Completeness [{status}]: {comp['covered_count']}/{comp['top_count']}"
+                     f" top-scored comments represented")
+    else:
+        lines.append(f"Completeness [UNAVAILABLE]: {comp['note']}")
     if comp["missing"]:
         for m in comp["missing"][:5]:
             lines.append(f"  - u/{m['author']} ({m['score']} pts): {m['body_preview']}")
@@ -464,6 +480,19 @@ def format_report(results):
                  f"{len(editorial['issues'])} sentence/duration issues")
     for issue in editorial["issues"][:5]:
         lines.append(f"  - line {issue['line']}: {issue['issue']}")
+    selection = results.get("editorial_selection")
+    if selection:
+        lines.append(f"Editorial selection [{'PASS' if selection['passed'] else 'FAIL'}]: "
+                     f"{len(selection['priority_leads'])} watchlist leads checked; "
+                     f"{selection['history_editions']} prior delivered editions; "
+                     f"{selection['bilt_bullets']}/{selection['bullet_count']} bullet bodies mention Bilt/Palladium/Obsidian")
+        if "bilt_heading_context_bullets" in selection:
+            lines.append(f"  Bilt heading context: {selection['bilt_heading_context_bullets']} bullets in "
+                         f"{selection['bilt_heading_sections']} sections (overlaps body mentions).")
+        if selection.get("source_subreddit_metrics_available"):
+            lines.append("  Cited-source subreddit counts (not topic counts): " +
+                         ", ".join(f"r/{name}: {count}" for name, count in selection["source_subreddit_bullets"].items()))
+        lines.extend(f"  - {issue}" for issue in selection["issues"][:5])
     lines.append(f"\nOverall: {'PASS' if passed else 'FAIL'}")
 
     return "\n".join(lines)

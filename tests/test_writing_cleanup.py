@@ -21,7 +21,8 @@ def document(text, position="end"):
 
 
 @pytest.mark.parametrize("text", ["reports credits arrived.", "Reports credits arrived.",
-    "**reports** credits arrived.", "notes a change.", "confirms approval.", "asks about eligibility."])
+    "**reports** credits arrived.", "notes a change.", "confirms approval.", "asks about eligibility.",
+    "says credits arrived.", "**Says** credits arrived."])
 def test_subjectless_end_citations_are_rejected(text):
     result, errors = verified.render_checked(document(text), [source()])
     assert result is None and any("subject" in e for e in errors)
@@ -29,6 +30,7 @@ def test_subjectless_end_citations_are_rejected(text):
 
 @pytest.mark.parametrize("text,position", [("reports credits arrived.", "start"),
     ("A cardholder reports credits arrived.", "end"), ("**Credit timing:** Credits arrived.", "end"),
+    ("says credits arrived.", "start"), ("A commenter says credits arrived.", "end"),
     ("Reports of missing credits remain unresolved.", "end"), ("Check the terms before applying.", "end")])
 def test_valid_sentences_and_leading_attribution_are_retained(text, position):
     assert not verified.render_checked(document(text, position), [source()])[1]
@@ -84,8 +86,9 @@ def test_evaluation_catches_rendered_fragment_and_missing_units():
     assert not evaluate(text, [source("A 3-4 wait.")])["editorial_quality"]["passed"]
 
 
-def test_bounded_model_repair_resolves_fragment():
-    replies = [document("reports credits arrived."), document("A cardholder reports credits arrived.")]
+@pytest.mark.parametrize("verb", ["reports", "says"])
+def test_bounded_model_repair_resolves_fragment(verb):
+    replies = [document(f"{verb} credits arrived."), document("A cardholder reports credits arrived.")]
     def invoke(prompt, **kwargs):
         return json.dumps(replies.pop(0))
     notes = [{"topic": "Credits", "text": "Credits arrived.", "source_ids": ["t1_a"]}]
@@ -98,7 +101,8 @@ def test_persistent_fragment_fails_without_sending_email(tmp_path):
     raw.write_text(json.dumps([source()]))
     bad = "# Digest\n\n- reports credits arrived. [u/alice](https://reddit.com/r/test/comments/p/topic/a/)"
     with patch.object(digest, "summarize", return_value=bad), patch.object(digest, "send_email") as send:
-        code = digest.main(["--from-json", str(raw), "--no-db", "--source-safe", "--quality", "strict",
+        code = digest.main(["--from-json", str(raw), "--digest-date", "2026-09-22",
+                           "--no-db", "--source-safe", "--quality", "strict",
                            "--save", str(tmp_path / "digest.md"), "--status-file", str(tmp_path / "status.json"),
                            "--quiet-summary"])
     assert code == 3

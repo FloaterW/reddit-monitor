@@ -6,6 +6,19 @@ All HTML is static — no live Reddit requests.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolate_delivery_state(tmp_path, monkeypatch):
+    """Mocked SMTP tests must never mark the real edition delivered."""
+    import daily_digest
+
+    monkeypatch.setattr(daily_digest, "DEFAULT_DELIVERY_LEDGER", tmp_path / "delivery.db")
+    monkeypatch.setattr(daily_digest, "DEFAULT_HISTORY_DB", tmp_path / "absent-history.db")
+    monkeypatch.delenv("DIGEST_DELIVERY_LEDGER", raising=False)
+    # A locally enabled API collector must never turn legacy fixture tests live.
+    monkeypatch.setenv("DIGEST_REDDIT_SOURCE", "legacy")
+    monkeypatch.delenv("DIGEST_INTELLIGENCE_STORE", raising=False)
+
+
 @pytest.fixture()
 def post_html():
     """Minimal old.reddit listing HTML with two post 'thing' divs."""
