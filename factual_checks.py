@@ -15,6 +15,16 @@ _NAMED_CARDS = {
     "Southwest Premier": r"\b(?:Southwest|SW)(?:\s+Rapid\s+Rewards)?\s+Premier\b",
     "Southwest Plus": r"\b(?:Southwest|SW)(?:\s+Rapid\s+Rewards)?\s+Plus\b",
 }
+_INK_FULL_NAME = r"(?:(?:Chase\s+)?Ink\s+(?:Business\s+)?(?:Cash|Unlimited|Preferred|Pref)|CIC|CIU|CIP)"
+_INK_LIST_NAME = rf"(?:{_INK_FULL_NAME}|Cash|Unlimited|Preferred|Pref)"
+_INK_COORDINATED = re.compile(
+    rf"\b{_INK_FULL_NAME}(?:\s*(?:(?:,\s*)?(?:and|&|/)|,)\s*{_INK_LIST_NAME}){{1,2}}\b"
+    # A bare variant must end a card list or lead directly into card/offer
+    # prose. 'Unlimited support/cashback' and 'Preferred Rewards' are not
+    # implicit Ink names. This recognizes identity only, never shared terms.
+    r"(?=\s*(?:$|[.,;:!?)]|\b(?:cards?|for|offers?|offering|have|has|had|are|were|is|was|"
+    r"both|each|earn|earns|with|under|at|show|shows|available|listed|targeted|bonus|bonuses|"
+    r"applications?|approved|denied|approval|denial)\b))", re.I)
 _NUMBER = r"\d[\d,]*(?:\.\d+)?[kK]?"
 _CREDIT = (rf"(?:(?:a|an|the|my|our|their|his|her)\s+)?(?:promised\s+)?"
            rf"(?:\${_NUMBER}\s+)?(?:(?:statement|retention|annual[- ]fee|fee)\s+)?"
@@ -76,6 +86,14 @@ def evidence_bodies(sources):
     """Parent context can establish a referent, but titles never do."""
     return [str(row.get("body", "")) for source in sources
             for row in [source, *source.get("parent_context", [])] if isinstance(row, dict)]
+
+
+def _coordinated_ink_cards(body):
+    """Resolve explicit Ink card lists within one cited body, not nearby perks."""
+    names = {"cash": "Ink Cash", "cic": "Ink Cash", "unlimited": "Ink Unlimited",
+             "ciu": "Ink Unlimited", "preferred": "Ink Preferred", "pref": "Ink Preferred", "cip": "Ink Preferred"}
+    return {names[token.casefold()] for match in _INK_COORDINATED.finditer(body)
+            for token in re.findall(r"\b(?:Cash|CIC|Unlimited|CIU|Preferred|Pref|CIP)\b", match.group(), re.I)}
 
 
 def _affirmative_matches(pattern, text):
@@ -307,10 +325,11 @@ def factual_issues(text, sources, *, edition_cutoff=None):
     """Reject specific unsupported identities, credit receipts and expiry claims."""
     plain = _plain(text)
     bodies = [_plain(body) for body in evidence_bodies(sources)]
-    evidence = " ".join(bodies)
+    coordinated_cards = set().union(*(_coordinated_ink_cards(body) for body in bodies))
     issues = []
     for name, pattern in _NAMED_CARDS.items():
-        if re.search(pattern, plain, re.I) and not re.search(pattern, evidence, re.I):
+        supported = name in coordinated_cards or any(re.search(pattern, body, re.I) for body in bodies)
+        if re.search(pattern, plain, re.I) and not supported:
             issues.append(f"{name} is not identified in the cited body or supplied parents. Remove the unsupported card identity; thread titles and model notes are not evidence.")
     if (list(_affirmative_matches(_CREDIT_RECEIPT, plain))
             and not any(list(_affirmative_matches(_CREDIT_RECEIPT, body)) for body in bodies)):
